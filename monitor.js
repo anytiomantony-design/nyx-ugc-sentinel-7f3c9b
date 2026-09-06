@@ -1,11 +1,8 @@
-/**
+/*
  * monitor.js
- * Playwright-based watcher that scrapes cards from a page and posts new ones to a Discord webhook.
- * - Supports RUN_ONCE=true for one-shot runs (useful for GitHub Actions).
- * - If GITHUB_TOKEN and GITHUB_REPOSITORY are present, it will load/save seen.json
- *   from/to the repository via the GitHub Contents API so state persists between runs.
- *
- * Requires: axios, dotenv, playwright
+ * Updated: only post the newest item on each scrape (by parsed timestamp),
+ * and ensure role pings work by providing fallback role IDs if env vars are missing.
+ * Keeps one-shot vs loop behavior and GitHub persistence.
  */
 
 const fs = require('fs');
@@ -25,12 +22,13 @@ const CONFIG = {
   TIMESTAMP_SELECTOR: process.env.TIMESTAMP_SELECTOR || '',
   SEEN_STORE: process.env.SEEN_STORE || 'seen.json',
   WEBHOOK_URL: process.env.DISCORD_WEBHOOK_URL,
+  // Fallback role IDs - these are used if corresponding env vars are not set
   ROLE_IDS: {
-    upcoming: process.env.ROLE_ID_UPCOMING,
-    paid: process.env.ROLE_ID_PAID,
-    regular: process.env.ROLE_ID_REGULAR,
-    abandoned: process.env.ROLE_ID_ABANDONED,
-    active: process.env.ROLE_ID_ACTIVE,
+    upcoming: process.env.ROLE_ID_UPCOMING || '1545880166683906118',
+    paid: process.env.ROLE_ID_PAID || '1545880048567984188',
+    regular: process.env.ROLE_ID_REGULAR || '1545881749064646777',
+    abandoned: process.env.ROLE_ID_ABANDONED || '1545880971415527504',
+    active: process.env.ROLE_ID_ACTIVE || '1545881407656558612',
   },
   COLORS: {
     upcoming: Number(process.env.COLOR_UPCOMING || 3447003),
@@ -48,7 +46,6 @@ if (!CONFIG.WEBHOOK_URL) {
   process.exit(1);
 }
 
-// Helper: GitHub Contents API helpers for seen.json persistence
 const GITHUB_API = axios.create({
   baseURL: 'https://api.github.com',
   timeout: 15000,
@@ -88,7 +85,6 @@ async function saveSeenGithub(store, previousSha) {
   }
 }
 
-// Local filesystem fallback
 function loadSeenLocal() {
   try {
     const raw = fs.readFileSync(CONFIG.SEEN_STORE, 'utf8');
@@ -101,33 +97,27 @@ function saveSeenLocal(store) {
   fs.writeFileSync(CONFIG.SEEN_STORE, JSON.stringify(store, null, 2));
 }
 
-// Unified load/save functions
 async function loadSeen() {
-  if (CONFIG.GITHUB_TOKEN && CONFIG.GITHUB_REPOSITORY) {
-    return await loadSeenGithub();
-  } else {
-    return loadSeenLocal();
-  }
+  if (CONFIG.GITHUB_TOKEN && CONFIG.GITHUB_REPOSITORY) return await loadSeenGithub();
+  return loadSeenLocal();
 }
 async function saveSeen(store, previousSha) {
-  if (CONFIG.GITHUB_TOKEN && CONFIG.GITHUB_REPOSITORY) {
-    return await saveSeenGithub(store, previousSha);
-  } else {
-    saveSeenLocal(store);
-    return null;
-  }
+  if (CONFIG.GITHUB_TOKEN && CONFIG.GITHUB_REPOSITORY) return await saveSeenGithub(store, previousSha);
+  saveSeenLocal(store);
+  return null;
 }
 
-// Build ID, embed, and post to Discord
 function idFromCard(card) {
   if (card.link) return card.link;
   return `${card.title}###${card.timestamp || ''}`;
 }
+
 function buildWebhookPayload(card) {
   const category = (card.category || 'regular').toLowerCase();
   const roleId = CONFIG.ROLE_IDS[category] || null;
   const color = CONFIG.COLORS[category] || CONFIG.COLORS.regular;
   const mention = roleId ? `<@&${roleId}>` : '';
+
   const embed = {
     title: card.title || 'UGC Item',
     url: card.link || undefined,
@@ -141,8 +131,10 @@ function buildWebhookPayload(card) {
   if (card.stock) embed.fields.push({ name: 'Stock', value: String(card.stock), inline: true });
   if (card.info) embed.fields.push({ name: 'Info', value: String(card.info).slice(0, 1024) });
   if (card.image) embed.image = { url: card.image };
+
   return { content: mention, embeds: [embed] };
 }
+
 async function postToDiscord(payload) {
   try {
     await axios.post(CONFIG.WEBHOOK_URL, payload);
@@ -152,12 +144,50 @@ async function postToDiscord(payload) {
   }
 }
 
-// Scraping (same heuristics as earlier)
+// Parse timestamp strings to milliseconds since epoch. Supports absolute dates and relative 'in Xd Xh Xm' formats.
+function parseTimestampToMillis(tsText) {
+  if (!tsText) return 0;
+  const s = String(tsText).trim();
+  // Try direct Date parse
+  const parsed = Date.parse(s);
+  if (!isNaN(parsed)) return parsed;
+
+  // Normalize: remove words like 'release', 'at', 'on', 'time', etc.
+  const cleaned = s.replace(/release[:]?/i, '').replace(/at /i, '').replace(/on /i, '').trim();
+  const parsed2 = Date.parse(cleaned);
+  if (!isNaN(parsed2)) return parsed2;
+
+  // Relative formats: 'in 6d 4h 37m', '6d 4h', '19h 32m 50s', 'in 19h 37m 11s'
+  const rel = cleaned.toLowerCase().replace(/^in\s+/, '');
+  const regex = /(?:(\d+)\s*d)?\s*(?:(\d+)\s*h)?\s*(?:(\d+)\s*m)?\s*(?:(\d+)\s*s)?/i;
+  const m = rel.match(regex);
+  if (m) {
+    const days = parseInt(m[1] || '0', 10);
+    const hours = parseInt(m[2] || '0', 10);
+    const mins = parseInt(m[3] || '0', 10);
+    const secs = parseInt(m[4] || '0', 10);
+    const delta = (((days * 24 + hours) * 60 + mins) * 60 + secs) * 1000;
+    if (delta > 0) {
+      return Date.now() + delta;
+    }
+  }
+
+  // Fallback: try to extract an ISO-like substring
+  const isoMatch = s.match(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:?\d{0,2}Z?/);
+  if (isoMatch) {
+    const p = Date.parse(isoMatch[0]);
+    if (!isNaN(p)) return p;
+  }
+
+  // Couldn't parse - return 0 so it will be treated as old
+  return 0;
+}
+
+// Scraping heuristics (same as before)
 async function scrapeOnce(browser) {
   const page = await browser.newPage();
   await page.goto(CONFIG.TARGET_URL, { waitUntil: 'networkidle' }).catch(() => page.waitForLoadState('domcontentloaded'));
 
-  // If CARD_SELECTOR provided, try it first
   if (CONFIG.CARD_SELECTOR) {
     try {
       const els = await page.$$(CONFIG.CARD_SELECTOR);
@@ -185,7 +215,6 @@ async function scrapeOnce(browser) {
     }
   }
 
-  // Heuristic fallback
   console.log('No exact card selector or no matches — using heuristic detector.');
   const heuristicKeywords = ['STOCK','METHOD','RELEASE','INFO','LIMIT','CLICK FOR DETAILS','RELEASE DATE','RELEASE:','CODE DROP'];
 
@@ -214,7 +243,7 @@ async function scrapeOnce(browser) {
       mainCandidates.forEach(n => candidateSet.add(n));
     }
     const makeCard = (el) => {
-      let title = el.querySelector('h2,h3,h1')?.innerText?.trim?.() || el.querySelector('strong')?.innerText?.trim?.() || (el.innerText||'').trim().split('\\n').map(s=>s.trim()).find(s=>s.length>2) || '';
+      let title = el.querySelector('h2,h3,h1')?.innerText?.trim?.() || el.querySelector('strong')?.innerText?.trim?.() || (el.innerText||'').trim().split('\n').map(s=>s.trim()).find(s=>s.length>2) || '';
       const anchors = Array.from(el.querySelectorAll('a')).map(a=>a.href).filter(Boolean);
       const link = anchors.find(a=>a.includes('roblox.com')) || anchors.find(a=>a.includes('/leaks/')) || anchors[0] || '';
       const candidateT = Array.from(el.querySelectorAll('*')).find(n => {
@@ -240,30 +269,33 @@ async function scrapeOnce(browser) {
   return cards;
 }
 
-async function runOnceFlow(browser, seenState) {
-  // seenState = { store: { seen: [] }, sha }
+// New behavior: only consider the newest card by parsed timestamp and post it once if unseen
+async function processNewestOnly(browser, seenState) {
   const items = await scrapeOnce(browser);
-  const newItems = [];
-  for (const card of items) {
-    const id = idFromCard(card);
-    if (!seenState.store.seen.includes(id)) {
-      newItems.push(card);
-      seenState.store.seen.push(id);
-    }
+  if (!items || items.length === 0) return false;
+
+  // Compute timestamp for each
+  for (const it of items) {
+    it._ts = parseTimestampToMillis(it.timestamp);
   }
-  if (newItems.length) {
-    console.log('Found', newItems.length, 'new item(s). Posting...');
-    for (const it of newItems) {
-      const payload = buildWebhookPayload(it);
-      await postToDiscord(payload);
-      await new Promise(r => setTimeout(r, 750));
-    }
-    // persist seen list
-    const newSha = await saveSeen(seenState.store, seenState.sha);
-    if (newSha) seenState.sha = newSha;
-  } else {
-    console.log('No new items.');
+  // Choose newest by _ts (max). If all ts are 0 (unparsable), fall back to the first item.
+  items.sort((a,b) => (b._ts || 0) - (a._ts || 0));
+  const newest = items[0];
+  const newestId = idFromCard(newest);
+  if (seenState.store.seen.includes(newestId)) {
+    console.log('Newest item already seen:', newest.title || newest.link || '(no title)');
+    return false;
   }
+
+  // Post only the newest item
+  console.log('Posting newest unseen item:', newest.title || newest.link || '(no title)');
+  const payload = buildWebhookPayload(newest);
+  await postToDiscord(payload);
+  // mark seen and persist
+  seenState.store.seen.push(newestId);
+  const newSha = await saveSeen(seenState.store, seenState.sha);
+  if (newSha) seenState.sha = newSha;
+  return true;
 }
 
 async function runLoopMode() {
@@ -273,7 +305,7 @@ async function runLoopMode() {
       try {
         const seenState = await loadSeen();
         console.log('Checking', CONFIG.TARGET_URL, 'at', new Date().toISOString());
-        await runOnceFlow(browser, seenState);
+        await processNewestOnly(browser, seenState);
       } catch (err) {
         console.error('Loop error:', err?.message || err);
       }
@@ -289,13 +321,12 @@ async function runOnceMode() {
   try {
     const seenState = await loadSeen();
     console.log('One-shot: Checking', CONFIG.TARGET_URL, 'at', new Date().toISOString());
-    await runOnceFlow(browser, seenState);
+    await processNewestOnly(browser, seenState);
   } finally {
     await browser.close();
   }
 }
 
-// Entrypoint
 (async () => {
   const runOnceEnv = (process.env.RUN_ONCE || '').toLowerCase() === 'true';
   if (runOnceEnv) {
@@ -304,7 +335,4 @@ async function runOnceMode() {
   } else {
     await runLoopMode();
   }
-})().catch(err => {
-  console.error('Fatal error:', err);
-  process.exit(1);
-}); 
+})();
