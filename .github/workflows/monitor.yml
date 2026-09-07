@@ -10,17 +10,42 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-node@v4
         with:
           node-version: '18'
+
       - name: Install dependencies
-        run: npm install
+        run: npm ci
+
+      - name: Install system deps for Playwright (Linux)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgbm-dev libnss3 libatk1.0-0 libatk-bridge2.0-0 libx11-xcb1 libxcomposite1 libxdamage1 libxrandr2 libasound2 libcups2 libdrm2 libxss1 libxtst6 libxkbfile1 libatspi2.0-0
+
       - name: Install Playwright browsers
-        run: npx playwright install --with-deps
+        uses: microsoft/playwright-action@v1
+        with:
+          install-deps: true
+
+      - name: Diagnostics (non-sensitive)
+        run: |
+          echo "Node: $(node -v)"
+          echo "NPM: $(npm -v)"
+          if [ -z "${{ secrets.DISCORD_WEBHOOK_URL }}" ]; then echo "DISCORD_WEBHOOK_URL: NOT SET"; else echo "DISCORD_WEBHOOK_URL: SET"; fi
+          if [ -z "${{ secrets.GITHUB_TOKEN }}" ]; then echo "GITHUB_TOKEN: NOT SET"; else echo "GITHUB_TOKEN: SET"; fi
+
       - name: Run monitor (one-shot)
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           RUN_ONCE: 'true'
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-        run: node monitor.js
+        run: |
+          node monitor.js 2>&1 | tee monitor.log
+
+      - name: Upload monitor logs
+        uses: actions/upload-artifact@v4 by
+        with:
+          name: monitor-log
+          path: monitor.log
