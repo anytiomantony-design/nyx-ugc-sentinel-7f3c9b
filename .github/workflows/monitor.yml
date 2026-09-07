@@ -45,7 +45,7 @@ jobs:
           node monitor.js 2>&1 | tee monitor.log
 
       - name: Upload monitor logs
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: monitor-log
           path: monitor.log
