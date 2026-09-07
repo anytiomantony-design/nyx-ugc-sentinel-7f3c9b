@@ -1,6 +1,6 @@
 /*
  * monitor.js
- * Full-history mode with retries/auto-scroll support.
+ * Full-history mode with retries/auto-scroll support and improved timestamp-first detection.
  */
 
 const fs = require('fs');
@@ -40,8 +40,8 @@ const CONFIG = {
   GITHUB_REPOSITORY: process.env.GITHUB_REPOSITORY || null,
   MIN_FRESHNESS_MINUTES: Number(process.env.MIN_FRESHNESS_MINUTES || 0),
   KEEP_HISTORY: Number(process.env.KEEP_HISTORY || 2000), // max archive items
-  SCRAPE_ATTEMPTS: Number(process.env.SCRAPE_ATTEMPTS || 3),
-  SCRAPE_ATTEMPT_DELAY_MS: Number(process.env.SCRAPE_ATTEMPT_DELAY_MS || 2000),
+  SCRAPE_ATTEMPTS: Number(process.env.SCRAPE_ATTEMPTS || 5),
+  SCRAPE_ATTEMPT_DELAY_MS: Number(process.env.SCRAPE_ATTEMPT_DELAY_MS || 3000),
   CLICK_SELECTOR: process.env.CATEGORY_BUTTON_SELECTOR || process.env.CLICK_SELECTOR || '',
 };
 
@@ -56,7 +56,7 @@ const GITHUB_API = axios.create({
   headers: CONFIG.GITHUB_TOKEN ? { Authorization: `token ${CONFIG.GITHUB_TOKEN}`, 'User-Agent': 'ugc-watcher' } : undefined,
 });
 
-// Helpers omitted for brevity (identical to previous version)
+// Helpers for generic file loads/saves via GitHub Contents API
 async function loadFileGithub(filename, defaultObj) {
   try {
     const url = `/repos/${CONFIG.GITHUB_REPOSITORY}/contents/${encodeURIComponent(filename)}`;
@@ -69,6 +69,7 @@ async function loadFileGithub(filename, defaultObj) {
     return { obj: defaultObj, sha: null };
   }
 }
+
 async function saveFileGithub(filename, obj, previousSha, commitMessage) {
   try {
     const url = `/repos/${CONFIG.GITHUB_REPOSITORY}/contents/${encodeURIComponent(filename)}`;
@@ -82,6 +83,7 @@ async function saveFileGithub(filename, obj, previousSha, commitMessage) {
     return null;
   }
 }
+
 function loadFileLocal(filename, defaultObj) { try { const raw = fs.readFileSync(filename, 'utf8'); return { obj: JSON.parse(raw), sha: null }; } catch (e) { return { obj: defaultObj, sha: null }; } }
 function saveFileLocal(filename, obj) { fs.writeFileSync(filename, JSON.stringify(obj, null, 2)); }
 async function loadJson(filename, defaultObj) { if (CONFIG.GITHUB_TOKEN && CONFIG.GITHUB_REPOSITORY) return await loadFileGithub(filename, defaultObj); return loadFileLocal(filename, defaultObj); }
@@ -99,7 +101,7 @@ async function postToDiscord(payload) { try { await axios.post(CONFIG.WEBHOOK_UR
 
 function parseTimestampToMillis(tsText) { if (!tsText) return 0; const s = String(tsText).trim(); const relMatchFull = s.match(/in\s*((?:\d+\s*d)?\s*(?:\d+\s*h)?\s*(?:\d+\s*m)?\s*(?:\d+\s*s)?)/i); if (relMatchFull) { const rel = relMatchFull[1]; const regex = /(?:(\d+)\s*d)?\s*(?:(\d+)\s*h)?\s*(?:(\d+)\s*m)?\s*(?:(\d+)\s*s)?/i; const m = rel.match(regex); if (m) { const days = parseInt(m[1] || '0', 10); const hours = parseInt(m[2] || '0', 10); const mins = parseInt(m[3] || '0', 10); const secs = parseInt(m[4] || '0', 10); const delta = (((days * 24 + hours) * 60 + mins) * 60 + secs) * 1000; if (delta > 0) return Date.now() + delta; } } const parsed = Date.parse(s); if (!isNaN(parsed)) return parsed; const cleaned = s.replace(/(release[:]?|at\s+|on\s+|pm|am)/ig, '').trim(); const parsed2 = Date.parse(cleaned); if (!isNaN(parsed2)) return parsed2; const rel2 = s.match(/(\d+\s*d|\d+\s*h|\d+\s*m|\d+\s*s)/ig); if (rel2) { let days=0,hours=0,mins=0,secs=0; rel2.forEach(part => { if (part.toLowerCase().includes('d')) days += parseInt(part); else if (part.toLowerCase().includes('h')) hours += parseInt(part); else if (part.toLowerCase().includes('m')) mins += parseInt(part); else if (part.toLowerCase().includes('s')) secs += parseInt(part); }); const delta = (((days * 24 + hours) * 60 + mins) * 60 + secs) * 1000; if (delta>0) return Date.now()+delta; } const isoMatch = s.match(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:?\d{0,2}Z?/); if (isoMatch) { const p = Date.parse(isoMatch[0]); if (!isNaN(p)) return p; } return 0; }
 
-// SCRAPE WITH RETRIES, CLICK, AND SCROLL
+// SCRAPE WITH RETRIES, CLICK, AND SCROLL + improved timestamp-first detection
 async function scrapeOnce(browser) {
   const page = await browser.newPage();
   await page.goto(CONFIG.TARGET_URL, { waitUntil: 'networkidle' }).catch(() => page.waitForLoadState('domcontentloaded'));
@@ -132,35 +134,69 @@ async function scrapeOnce(browser) {
       }
     }
 
-    // heuristic extraction
-    const heuristicKeywords = ['STOCK','METHOD','RELEASE','INFO','LIMIT','CLICK FOR DETAILS','RELEASE DATE','RELEASE:','CODE DROP'];
-    const cards = await page.evaluate((keywords) => {
-      function hasKeyword(node) { if (!node) return false; const txt=(node.innerText||'').toUpperCase(); return keywords.some(k=>txt.includes(k)); }
-      const hits = Array.from(document.querySelectorAll('body *')).filter(el => {
-        if (!el.offsetParent && el.clientHeight===0 && el.clientWidth===0) return false;
-        try { return hasKeyword(el);} catch { return false; }
-      });
+    // heuristic extraction with timestamp-first candidate addition
+    const cards = await page.evaluate(() => {
+      const keywords = ['STOCK','METHOD','RELEASE','INFO','LIMIT','CLICK FOR DETAILS','RELEASE DATE','RELEASE:','CODE DROP'];
+
       const candidateSet = new Set();
-      for (const hit of hits) {
-        let ancestor = hit;
-        for (let i=0;i<6 && ancestor && ancestor.tagName!=='BODY'; i++) {
-          const imgs = ancestor.querySelectorAll('img').length;
-          const links = ancestor.querySelectorAll('a').length;
-          const headings = ancestor.querySelectorAll('h1,h2,h3').length;
-          const textLen = (ancestor.innerText||'').length;
-          if ((imgs+links+headings)>=1 && textLen>20) { candidateSet.add(ancestor); break; }
-          ancestor = ancestor.parentElement;
+
+      // 1) Timestamp-first: find nodes that contain relative time patterns like "in 2m", "2m 49s", etc.
+      const relRegex = /(?:\bin\s*)?\d+\s*(?:d|h|m|s)\b/i;
+      try {
+        const all = Array.from(document.querySelectorAll('body *'));
+        for (const n of all) {
+          try {
+            const txt = (n.innerText || '');
+            if (relRegex.test(txt)) {
+              // add a nearby ancestor that looks card-like
+              let ancestor = n;
+              for (let i=0; i<6 && ancestor && ancestor.tagName !== 'BODY'; i++) {
+                const imgs = ancestor.querySelectorAll('img').length;
+                const links = ancestor.querySelectorAll('a').length;
+                const headings = ancestor.querySelectorAll('h1,h2,h3').length;
+                const textLen = (ancestor.innerText || '').length;
+                if ((imgs + links + headings) >= 1 && textLen > 20) { candidateSet.add(ancestor); break; }
+                ancestor = ancestor.parentElement;
+              }
+            }
+          } catch (e) { }
         }
+      } catch (e) { }
+
+      // 2) Keyword-based hits (previous heuristic)
+      try {
+        const hits = Array.from(document.querySelectorAll('body *')).filter(el => {
+          if (!el.offsetParent && el.clientHeight === 0 && el.clientWidth === 0) return false;
+          try { const txt=(el.innerText||'').toUpperCase(); return keywords.some(k=>txt.includes(k)); } catch { return false; }
+        });
+        for (const hit of hits) {
+          let ancestor = hit;
+          for (let i=0; i<6 && ancestor && ancestor.tagName !== 'BODY'; i++) {
+            const imgs = ancestor.querySelectorAll('img').length;
+            const links = ancestor.querySelectorAll('a').length;
+            const headings = ancestor.querySelectorAll('h1,h2,h3').length;
+            const textLen = (ancestor.innerText || '').length;
+            if ((imgs + links + headings) >= 1 && textLen > 20) { candidateSet.add(ancestor); break; }
+            ancestor = ancestor.parentElement;
+          }
+        }
+      } catch (e) { }
+
+      // 3) fallback: main/section divs
+      if (candidateSet.size === 0) {
+        const mainCandidates = Array.from(document.querySelectorAll('main div, section div')).filter(n => {
+          const t = (n.innerText||'').length; return t > 100 && n.querySelectorAll('a,img').length >= 1;
+        }).slice(0,30);
+        mainCandidates.forEach(n => candidateSet.add(n));
       }
-      if (candidateSet.size===0) {
-        const mainCandidates = Array.from(document.querySelectorAll('main div, section div')).filter(n=>{ const t=(n.innerText||'').length; return t>100 && n.querySelectorAll('a,img').length>=1; }).slice(0,30);
-        mainCandidates.forEach(n=>candidateSet.add(n));
-      }
+
       const makeCard = (el) => {
         let title = el.querySelector('h2,h3,h1')?.innerText?.trim?.() || el.querySelector('strong')?.innerText?.trim?.() || (el.innerText||'').trim().split('\n').map(s=>s.trim()).find(s=>s.length>2) || '';
         const anchors = Array.from(el.querySelectorAll('a')).map(a=>a.href).filter(Boolean);
         const link = anchors.find(a=>a.includes('roblox.com')) || anchors.find(a=>a.includes('/leaks/')) || anchors[0] || '';
-        const candidateT = Array.from(el.querySelectorAll('*')).find(n => { const t=(n.innerText||'').toLowerCase(); return t.includes('release') || t.includes('release date') || /\d{1,2}\s*(d|h|m|s)|\d{1,2}:\d{2}/.test(t); });
+        const candidateT = Array.from(el.querySelectorAll('*')).find(n => {
+          const t=(n.innerText||'').toLowerCase(); return t.includes('release') || t.includes('release date') || /\d{1,2}\s*(d|h|m|s)|\d{1,2}:\d{2}/.test(t);
+        });
         const timestamp = candidateT ? candidateT.innerText.trim() : '';
         const stock = Array.from(el.querySelectorAll('*')).find(n=>(n.innerText||'').toUpperCase().includes('STOCK'))?.innerText.trim() || '';
         const method = Array.from(el.querySelectorAll('*')).find(n=>(n.innerText||'').toUpperCase().includes('METHOD'))?.innerText.trim() || '';
@@ -171,11 +207,14 @@ async function scrapeOnce(browser) {
         if (catNode) category = (catNode.innerText||'').trim().toLowerCase();
         return { title, link, timestamp, stock, method, info, image, category };
       };
-      const result=[]; candidateSet.forEach(el=>{ try { result.push(makeCard(el)); } catch {} });
-      const uniq=[]; const seen=new Set();
-      for (const c of result) { const key=(c.link||'')+'||'+(c.title||'').slice(0,80); if (!seen.has(key)) { seen.add(key); uniq.push(c); } }
+
+      const result = [];
+      candidateSet.forEach(el => { try { result.push(makeCard(el)); } catch {} });
+      const uniq = []; const seen = new Set();
+      for (const c of result) { const key = (c.link||'') + '||' + (c.title||'').slice(0,80); if (!seen.has(key)) { seen.add(key); uniq.push(c); } }
       return uniq;
-    }, heuristicKeywords);
+    });
+
     return cards;
   }
 
@@ -220,7 +259,6 @@ async function scrapeOnce(browser) {
   return lastResult;
 }
 
-// persistFetchedAndArchive, processFlow, run modes unchanged (re-use existing functions)
 async function persistFetchedAndArchive(items, seenState) {
   // annotate items
   const now = Date.now();
