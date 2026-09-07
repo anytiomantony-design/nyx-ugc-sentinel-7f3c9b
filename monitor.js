@@ -1,11 +1,10 @@
 /*
- * monitor.js (all-in fixes)
- * - Posts only the newest unseen item by timestamp
- * - Adds top-card fallback: if the top (first) card changes, treat it as new
- * - Adds MIN_FRESHNESS_MINUTES env to skip items older than threshold
- * - Adds RUN_SEED=true mode to populate seen.json without posting
- * - Adds verbose diagnostics logging of found items and parsed timestamps
- * - Persists seen.json and last_top into the repo via GITHUB_TOKEN when available
+ * monitor.js
+ * Full-history mode: saves fetched.json (latest scrape) and archive.json (append-only history of newly-seen cards).
+ * - fetched.json contains the canonical set of cards found on the page each run.
+ * - archive.json appends newly-seen cards (compared to seen.json) and is trimmed to KEEP_HISTORY.
+ * - fetched.json is committed only when content changed to avoid commit spam; archive.json is committed when new items appended.
+ * - Integrates with existing seen.json and posting logic.
  */
 
 const fs = require('fs');
@@ -24,6 +23,8 @@ const CONFIG = {
   LINK_SELECTOR: process.env.LINK_SELECTOR || '',
   TIMESTAMP_SELECTOR: process.env.TIMESTAMP_SELECTOR || '',
   SEEN_STORE: process.env.SEEN_STORE || 'seen.json',
+  FETCH_STORE: process.env.FETCH_STORE || 'fetched.json',
+  ARCHIVE_STORE: process.env.ARCHIVE_STORE || 'archive.json',
   WEBHOOK_URL: process.env.DISCORD_WEBHOOK_URL,
   ROLE_IDS: {
     upcoming: process.env.ROLE_ID_UPCOMING || '1545880166683906118',
@@ -42,6 +43,7 @@ const CONFIG = {
   GITHUB_TOKEN: process.env.GITHUB_TOKEN || null,
   GITHUB_REPOSITORY: process.env.GITHUB_REPOSITORY || null,
   MIN_FRESHNESS_MINUTES: Number(process.env.MIN_FRESHNESS_MINUTES || 0),
+  KEEP_HISTORY: Number(process.env.KEEP_HISTORY || 2000), // max archive items
 };
 
 if (!CONFIG.WEBHOOK_URL) {
@@ -55,64 +57,89 @@ const GITHUB_API = axios.create({
   headers: CONFIG.GITHUB_TOKEN ? { Authorization: `token ${CONFIG.GITHUB_TOKEN}`, 'User-Agent': 'ugc-watcher' } : undefined,
 });
 
-async function loadSeenGithub() {
+// Helpers for generic file loads/saves via GitHub Contents API
+async function loadFileGithub(filename, defaultObj) {
   try {
-    const url = `/repos/${CONFIG.GITHUB_REPOSITORY}/contents/${encodeURIComponent(CONFIG.SEEN_STORE)}`;
+    const url = `/repos/${CONFIG.GITHUB_REPOSITORY}/contents/${encodeURIComponent(filename)}`;
     const res = await GITHUB_API.get(url);
     const content = Buffer.from(res.data.content, 'base64').toString('utf8');
-    const parsed = JSON.parse(content);
-    return { store: parsed, sha: res.data.sha };
+    return { obj: JSON.parse(content), sha: res.data.sha };
   } catch (err) {
-    if (err.response && err.response.status === 404) return { store: { seen: [], last_top: null }, sha: null };
-    console.warn('GitHub load seen failed:', err.message || err.toString());
-    return { store: { seen: [], last_top: null }, sha: null };
+    if (err.response && err.response.status === 404) return { obj: defaultObj, sha: null };
+    console.warn(`GitHub load ${filename} failed:`, err.message || err.toString());
+    return { obj: defaultObj, sha: null };
   }
 }
 
-async function saveSeenGithub(store, previousSha) {
+async function saveFileGithub(filename, obj, previousSha, commitMessage) {
   try {
-    const url = `/repos/${CONFIG.GITHUB_REPOSITORY}/contents/${encodeURIComponent(CONFIG.SEEN_STORE)}`;
-    const contentBase64 = Buffer.from(JSON.stringify(store, null, 2), 'utf8').toString('base64');
-    const payload = { message: 'Update seen.json by ugc-watcher', content: contentBase64 };
+    const url = `/repos/${CONFIG.GITHUB_REPOSITORY}/contents/${encodeURIComponent(filename)}`;
+    const contentBase64 = Buffer.from(JSON.stringify(obj, null, 2), 'utf8').toString('base64');
+    const payload = { message: commitMessage || `Update ${filename} by ugc-watcher`, content: contentBase64 };
     if (previousSha) payload.sha = previousSha;
     const res = await GITHUB_API.put(url, payload);
     return res.data.content.sha;
   } catch (err) {
-    console.error('GitHub save seen failed:', err.response?.status, err.response?.data || err.message);
+    console.error(`GitHub save ${filename} failed:`, err.response?.status, err.response?.data || err.message);
     return null;
   }
 }
 
-function loadSeenLocal() {
+// Local filesystem fallbacks
+function loadFileLocal(filename, defaultObj) {
   try {
-    const raw = fs.readFileSync(CONFIG.SEEN_STORE, 'utf8');
-    const parsed = JSON.parse(raw);
-    if (!parsed.seen) parsed.seen = [];
-    if (!('last_top' in parsed)) parsed.last_top = null;
-    return { store: parsed, sha: null };
+    const raw = fs.readFileSync(filename, 'utf8');
+    return { obj: JSON.parse(raw), sha: null };
   } catch (e) {
-    return { store: { seen: [], last_top: null }, sha: null };
+    return { obj: defaultObj, sha: null };
   }
 }
-function saveSeenLocal(store) {
-  fs.writeFileSync(CONFIG.SEEN_STORE, JSON.stringify(store, null, 2));
+function saveFileLocal(filename, obj) {
+  fs.writeFileSync(filename, JSON.stringify(obj, null, 2));
 }
 
-async function loadSeen() {
-  if (CONFIG.GITHUB_TOKEN && CONFIG.GITHUB_REPOSITORY) return await loadSeenGithub();
-  return loadSeenLocal();
+async function loadJson(filename, defaultObj) {
+  if (CONFIG.GITHUB_TOKEN && CONFIG.GITHUB_REPOSITORY) return await loadFileGithub(filename, defaultObj);
+  return loadFileLocal(filename, defaultObj);
 }
-async function saveSeen(store, previousSha) {
-  if (CONFIG.GITHUB_TOKEN && CONFIG.GITHUB_REPOSITORY) return await saveSeenGithub(store, previousSha);
-  saveSeenLocal(store);
+async function saveJson(filename, obj, previousSha, commitMessage) {
+  if (CONFIG.GITHUB_TOKEN && CONFIG.GITHUB_REPOSITORY) return await saveFileGithub(filename, obj, previousSha, commitMessage);
+  saveFileLocal(filename, obj);
   return null;
 }
 
+// seen.json helpers (keeps seen[] and last_top)
+async function loadSeen() {
+  const def = { seen: [], last_top: null };
+  return await loadJson(CONFIG.SEEN_STORE, def);
+}
+async function saveSeen(store, previousSha) {
+  return await saveJson(CONFIG.SEEN_STORE, store, previousSha, 'Update seen.json by ugc-watcher');
+}
+
+// fetched.json helpers
+async function loadFetched() {
+  const def = { fetched: [], scraped_at: null };
+  return await loadJson(CONFIG.FETCH_STORE, def);
+}
+async function saveFetched(obj, previousSha) {
+  return await saveJson(CONFIG.FETCH_STORE, obj, previousSha, 'Update fetched.json by ugc-watcher');
+}
+
+// archive.json helpers
+async function loadArchive() {
+  const def = { archive: [] };
+  return await loadJson(CONFIG.ARCHIVE_STORE, def);
+}
+async function saveArchive(obj, previousSha) {
+  return await saveJson(CONFIG.ARCHIVE_STORE, obj, previousSha, 'Append archive.json by ugc-watcher');
+}
+
+// Utility: create ID, payload, post
 function idFromCard(card) {
   if (card.link) return card.link;
   return `${card.title}###${card.timestamp || ''}`;
 }
-
 function buildWebhookPayload(card) {
   const category = (card.category || 'regular').toLowerCase();
   const roleId = CONFIG.ROLE_IDS[category] || null;
@@ -133,7 +160,6 @@ function buildWebhookPayload(card) {
   if (card.image) embed.image = { url: card.image };
   return { content: mention, embeds: [embed] };
 }
-
 async function postToDiscord(payload) {
   try {
     await axios.post(CONFIG.WEBHOOK_URL, payload);
@@ -143,11 +169,10 @@ async function postToDiscord(payload) {
   }
 }
 
-// Enhanced timestamp parser
+// Timestamp parser (as before)
 function parseTimestampToMillis(tsText) {
   if (!tsText) return 0;
   const s = String(tsText).trim();
-  // If it contains both a relative 'in X' and an absolute date like "in 19h... Monday, Sep 7, 2026" prefer relative
   const relMatchFull = s.match(/in\s*((?:\d+\s*d)?\s*(?:\d+\s*h)?\s*(?:\d+\s*m)?\s*(?:\d+\s*s)?)/i);
   if (relMatchFull) {
     const rel = relMatchFull[1];
@@ -162,17 +187,11 @@ function parseTimestampToMillis(tsText) {
       if (delta > 0) return Date.now() + delta;
     }
   }
-
-  // Try ISO / Date.parse
   const parsed = Date.parse(s);
   if (!isNaN(parsed)) return parsed;
-
-  // Try cleaning common words then parse
   const cleaned = s.replace(/(release[:]?|at\s+|on\s+|pm|am)/ig, '').trim();
   const parsed2 = Date.parse(cleaned);
   if (!isNaN(parsed2)) return parsed2;
-
-  // Try extracting relative components without 'in'
   const rel2 = s.match(/(\d+\s*d|\d+\s*h|\d+\s*m|\d+\s*s)/ig);
   if (rel2) {
     let days=0,hours=0,mins=0,secs=0;
@@ -180,14 +199,12 @@ function parseTimestampToMillis(tsText) {
     const delta = (((days * 24 + hours) * 60 + mins) * 60 + secs) * 1000;
     if (delta>0) return Date.now()+delta;
   }
-
-  // ISO-like substring
   const isoMatch = s.match(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:?\d{0,2}Z?/);
   if (isoMatch) { const p = Date.parse(isoMatch[0]); if (!isNaN(p)) return p; }
-
   return 0;
 }
 
+// Scrape as before (keeps heuristic)
 async function scrapeOnce(browser) {
   const page = await browser.newPage();
   await page.goto(CONFIG.TARGET_URL, { waitUntil: 'networkidle' }).catch(() => page.waitForLoadState('domcontentloaded'));
@@ -264,61 +281,116 @@ async function scrapeOnce(browser) {
   return cards;
 }
 
-// processNewestOnly: posts newest unseen by timestamp, with top-card fallback and freshness filter
-async function processNewestOnly(browser, seenState, options={}) {
+// New: save fetched and archive
+async function persistFetchedAndArchive(items, seenState) {
+  // annotate items
+  const now = Date.now();
+  const annotated = items.map(it => ({
+    id: idFromCard(it),
+    title: it.title || '',
+    link: it.link || '',
+    timestamp_raw: it.timestamp || '',
+    timestamp_parsed: parseTimestampToMillis(it.timestamp) || 0,
+    category: it.category || '',
+    image: it.image || '',
+    method: it.method || '',
+    stock: it.stock || '',
+    info: it.info || '',
+    scraped_at: now
+  }));
+
+  // load existing fetched & archive
+  const fetchedState = await loadFetched();
+  const fetchedPrev = fetchedState.obj || { fetched: [], scraped_at: null };
+  const archiveState = await loadArchive();
+  const archivePrev = archiveState.obj || { archive: [] };
+
+  // build canonical fetched sorted by newest parsed ts then fallback
+  annotated.sort((a,b)=> (b.timestamp_parsed||0) - (a.timestamp_parsed||0));
+  const fetchedObj = { fetched: annotated, scraped_at: now };
+
+  // compare fetchedObj to fetchedPrev, commit only if changed
+  const fetchedStrNew = JSON.stringify(fetchedObj, null, 2);
+  const fetchedStrPrev = JSON.stringify(fetchedPrev, null, 2);
+  if (fetchedStrNew !== fetchedStrPrev) {
+    console.log('fetched.json changed — saving updated fetched list.');
+    const newSha = await saveFetched(fetchedObj, fetchedState.sha);
+    if (newSha) console.log('Saved fetched.json (sha:', newSha, ')');
+  } else {
+    console.log('fetched.json unchanged — not committing.');
+  }
+
+  // append to archive any items whose id not in seenState.store.seen and not already in archive
+  const existingArchiveIds = new Set((archivePrev.archive||[]).map(a=>a.id));
+  const seenIds = new Set(seenState.store.seen || []);
+  const toAppend = [];
+  for (const it of annotated) {
+    if (!seenIds.has(it.id) && !existingArchiveIds.has(it.id)) {
+      toAppend.push(it);
+    }
+  }
+
+  if (toAppend.length > 0) {
+    console.log('Appending', toAppend.length, 'new item(s) to archive.json');
+    const newArchive = (archivePrev.archive||[]).concat(toAppend);
+    // trim if necessary keeping newest first
+    newArchive.sort((a,b)=> (b.scraped_at||0) - (a.scraped_at||0));
+    if (CONFIG.KEEP_HISTORY > 0 && newArchive.length > CONFIG.KEEP_HISTORY) newArchive.length = CONFIG.KEEP_HISTORY;
+    const archiveObj = { archive: newArchive };
+    const newSha = await saveArchive(archiveObj, archiveState.sha);
+    if (newSha) console.log('Saved archive.json (sha:', newSha, ')');
+  } else {
+    console.log('No new archive items to append.');
+  }
+}
+
+// process flow uses annotated items and persists fetched/archive
+async function processFlow(browser, seenState) {
   const items = await scrapeOnce(browser);
-  if (!items || items.length===0) { console.log('No items found on page.'); return false; }
+  if (!items || items.length === 0) { console.log('No items found on page.'); return false; }
 
-  // Log discovered items for debugging
-  console.log('Discovered', items.length, 'cards:');
-  items.forEach((it, idx) => {
-    const parsed = parseTimestampToMillis(it.timestamp);
-    const ago = parsed ? Math.round((Date.now()-parsed)/1000) : null;
-    console.log(`#${idx+1}: title="${it.title}" link=${it.link || '(none)'} tsText="${it.timestamp}" parsed=${parsed} (${ago!==null?ago+'s ago':'unparsed'}) category=${it.category}`);
-    it._ts = parsed;
-  });
+  // save fetched & archive for diagnostics/history
+  await persistFetchedAndArchive(items, seenState);
 
-  // one-shot behavior: seed-only
+  // existing posting logic: compute parsed timestamps and pick newest -> fallback to top
+  items.forEach(it => it._ts = parseTimestampToMillis(it.timestamp) || 0);
+  items.sort((a,b)=> (b._ts||0) - (a._ts||0));
+  const newest = items[0];
+  const newestId = idFromCard(newest);
+  const now = Date.now();
+
   if ((process.env.RUN_SEED || '').toLowerCase() === 'true') {
-    console.log('RUN_SEED=true -> seeding seen.json with current items (no posts).');
+    console.log('RUN_SEED=true: seeding seen.json with current fetched items (no posts).');
     for (const it of items) {
       const id = idFromCard(it);
       if (!seenState.store.seen.includes(id)) seenState.store.seen.push(id);
     }
-    // also update last_top
-    const topId = idFromCard(items[0]);
-    seenState.store.last_top = topId;
+    seenState.store.last_top = idFromCard(items[0]);
     await saveSeen(seenState.store, seenState.sha);
-    console.log('Seeding complete.');
     return false;
   }
 
-  // Freshness filter check
-  const newestByTs = items.slice().sort((a,b)=> (b._ts||0) - (a._ts||0))[0];
-  const newestId = idFromCard(newestByTs);
-  const now = Date.now();
-  if (CONFIG.MIN_FRESHNESS_MINUTES > 0 && (newestByTs._ts || 0) > 0) {
+  // freshness check
+  if (CONFIG.MIN_FRESHNESS_MINUTES > 0 && (newest._ts || 0) > 0) {
     const threshold = now - CONFIG.MIN_FRESHNESS_MINUTES * 60 * 1000;
-    if ((newestByTs._ts || 0) < threshold) {
-      console.log(`Newest item timestamp is older than MIN_FRESHNESS_MINUTES=${CONFIG.MIN_FRESHNESS_MINUTES}. Skipping.`);
-      // update last_top so we don't repeatedly check same top if desired
+    if ((newest._ts || 0) < threshold) {
+      console.log(`Newest item timestamp older than MIN_FRESHNESS_MINUTES=${CONFIG.MIN_FRESHNESS_MINUTES}. Skipping.`);
       seenState.store.last_top = idFromCard(items[0]);
       await saveSeen(seenState.store, seenState.sha);
       return false;
     }
   }
 
-  // If newest unseen, post it
-  if (!seenState.store.seen.includes(newestId) && (newestByTs._ts || 0) > 0) {
-    console.log('Posting newest unseen item by timestamp:', newestByTs.title || newestByTs.link || '(no title)');
-    await postToDiscord(buildWebhookPayload(newestByTs));
+  if (!seenState.store.seen.includes(newestId) && (newest._ts || 0) > 0) {
+    console.log('Posting newest unseen item by timestamp:', newest.title || newest.link || '(no title)');
+    await postToDiscord(buildWebhookPayload(newest));
     seenState.store.seen.push(newestId);
     seenState.store.last_top = idFromCard(items[0]);
     await saveSeen(seenState.store, seenState.sha);
     return true;
   }
 
-  // Top-card fallback: if the top card changed since last run, treat top as new (useful when timestamps unparseable)
+  // fallback: if top card changed since last_top
   const topItem = items[0];
   const topId = idFromCard(topItem);
   if (seenState.store.last_top !== topId) {
@@ -335,10 +407,11 @@ async function processNewestOnly(browser, seenState, options={}) {
     return true;
   }
 
-  console.log('No new items to post. Newest by ts:', newestByTs.title || '(no title)');
+  console.log('No new items to post. Newest by ts:', newest.title || '(no title)');
   return false;
 }
 
+// loop and one-shot modes
 async function runLoopMode() {
   const browser = await chromium.launch({ headless: true });
   try {
@@ -346,7 +419,7 @@ async function runLoopMode() {
       try {
         const seenState = await loadSeen();
         console.log('Checking', CONFIG.TARGET_URL, 'at', new Date().toISOString());
-        await processNewestOnly(browser, seenState);
+        await processFlow(browser, seenState);
       } catch (err) { console.error('Loop error:', err?.message || err); }
       await new Promise(r => setTimeout(r, CONFIG.POLL_INTERVAL_SECONDS * 1000));
     }
@@ -358,7 +431,7 @@ async function runOnceMode() {
   try {
     const seenState = await loadSeen();
     console.log('One-shot: Checking', CONFIG.TARGET_URL, 'at', new Date().toISOString());
-    await processNewestOnly(browser, seenState);
+    await processFlow(browser, seenState);
   } finally { await browser.close(); }
 }
 
