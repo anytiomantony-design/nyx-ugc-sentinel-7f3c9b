@@ -1,6 +1,8 @@
 /*
  * monitor.js
  * Full-history mode with retries/auto-scroll support and improved timestamp-first detection.
+ * Safety change: if DISCORD_WEBHOOK_URL is not provided, the script will no longer exit with code 1.
+ * Instead, posting is disabled and the scraper will continue to fetch/save data so the workflow does not fail silently.
  */
 
 const fs = require('fs');
@@ -45,9 +47,11 @@ const CONFIG = {
   CLICK_SELECTOR: process.env.CATEGORY_BUTTON_SELECTOR || process.env.CLICK_SELECTOR || '',
 };
 
+// If webhook not set, don't exit — disable posting but continue scraping & persisting so workflow won't fail.
+let POST_ENABLED = true;
 if (!CONFIG.WEBHOOK_URL) {
-  console.error('ERROR: DISCORD_WEBHOOK_URL not set in environment.');
-  process.exit(1);
+  console.warn('WARNING: DISCORD_WEBHOOK_URL not set — posting disabled. The scraper will still run and save fetched/archive/seen but will not POST to webhook.');
+  POST_ENABLED = false;
 }
 
 const GITHUB_API = axios.create({
@@ -97,7 +101,7 @@ async function saveArchive(obj, previousSha) { return await saveJson(CONFIG.ARCH
 
 function idFromCard(card) { if (card.link) return card.link; return `${card.title}###${card.timestamp || ''}`; }
 function buildWebhookPayload(card) { const category = (card.category || 'regular').toLowerCase(); const roleId = CONFIG.ROLE_IDS[category] || null; const color = CONFIG.COLORS[category] || CONFIG.COLORS.regular; const mention = roleId ? `<@&${roleId}>` : ''; const embed = { title: card.title || 'UGC Item', url: card.link || undefined, description: card.description || '', color, fields: [], timestamp: new Date().toISOString(), }; if (card.timestamp) embed.fields.push({ name: 'Release / Time', value: String(card.timestamp), inline: true }); if (card.method) embed.fields.push({ name: 'Method', value: String(card.method), inline: true }); if (card.stock) embed.fields.push({ name: 'Stock', value: String(card.stock), inline: true }); if (card.info) embed.fields.push({ name: 'Info', value: String(card.info).slice(0, 1024) }); if (card.image) embed.image = { url: card.image }; return { content: mention, embeds: [embed] }; }
-async function postToDiscord(payload) { try { await axios.post(CONFIG.WEBHOOK_URL, payload); console.log('Posted to webhook:', payload.embeds?.[0]?.title); } catch (err) { console.error('Webhook post failed:', err.response?.status, err.response?.data || err.message); } }
+async function postToDiscord(payload) { if (!POST_ENABLED) { console.log('Posting disabled — webhook not configured. Skipping post for:', payload.embeds?.[0]?.title); return; } try { await axios.post(CONFIG.WEBHOOK_URL, payload); console.log('Posted to webhook:', payload.embeds?.[0]?.title); } catch (err) { console.error('Webhook post failed:', err.response?.status, err.response?.data || err.message); } }
 
 function parseTimestampToMillis(tsText) { if (!tsText) return 0; const s = String(tsText).trim(); const relMatchFull = s.match(/in\s*((?:\d+\s*d)?\s*(?:\d+\s*h)?\s*(?:\d+\s*m)?\s*(?:\d+\s*s)?)/i); if (relMatchFull) { const rel = relMatchFull[1]; const regex = /(?:(\d+)\s*d)?\s*(?:(\d+)\s*h)?\s*(?:(\d+)\s*m)?\s*(?:(\d+)\s*s)?/i; const m = rel.match(regex); if (m) { const days = parseInt(m[1] || '0', 10); const hours = parseInt(m[2] || '0', 10); const mins = parseInt(m[3] || '0', 10); const secs = parseInt(m[4] || '0', 10); const delta = (((days * 24 + hours) * 60 + mins) * 60 + secs) * 1000; if (delta > 0) return Date.now() + delta; } } const parsed = Date.parse(s); if (!isNaN(parsed)) return parsed; const cleaned = s.replace(/(release[:]?|at\s+|on\s+|pm|am)/ig, '').trim(); const parsed2 = Date.parse(cleaned); if (!isNaN(parsed2)) return parsed2; const rel2 = s.match(/(\d+\s*d|\d+\s*h|\d+\s*m|\d+\s*s)/ig); if (rel2) { let days=0,hours=0,mins=0,secs=0; rel2.forEach(part => { if (part.toLowerCase().includes('d')) days += parseInt(part); else if (part.toLowerCase().includes('h')) hours += parseInt(part); else if (part.toLowerCase().includes('m')) mins += parseInt(part); else if (part.toLowerCase().includes('s')) secs += parseInt(part); }); const delta = (((days * 24 + hours) * 60 + mins) * 60 + secs) * 1000; if (delta>0) return Date.now()+delta; } const isoMatch = s.match(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:?\d{0,2}Z?/); if (isoMatch) { const p = Date.parse(isoMatch[0]); if (!isNaN(p)) return p; } return 0; }
 
