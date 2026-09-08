@@ -352,3 +352,4 @@ async function runLoopMode() { const browser = await chromium.launch({ headless:
 async function runOnceMode() { const browser = await chromium.launch({ headless: true }); try { const seenState = await loadSeen(); console.log('One-shot: Checking', CONFIG.TARGET_URL, 'at', new Date().toISOString()); await processFlow(browser, seenState); } finally { await browser.close(); } }
 
 (async () => { const runOnceEnv = (process.env.RUN_ONCE || '').toLowerCase() === 'true'; if (runOnceEnv) { await runOnceMode(); process.exit(0); } else { await runLoopMode(); } })();
+
