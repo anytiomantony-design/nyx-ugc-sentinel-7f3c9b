@@ -30,6 +30,7 @@ jobs:
           echo "NPM: $(npm -v)"
           if [ -z "${{ secrets.DISCORD_WEBHOOK_URL }}" ]; then echo "DISCORD_WEBHOOK_URL: NOT SET"; else echo "DISCORD_WEBHOOK_URL: SET"; fi
           if [ -z "${{ secrets.GITHUB_TOKEN }}" ]; then echo "GITHUB_TOKEN: NOT SET"; else echo "GITHUB_TOKEN: SET"; fi
+          if [ -z "${{ secrets.ROLE_ID_UPCOMING }}" ]; then echo "ROLE_ID_UPCOMING: NOT SET"; else echo "ROLE_ID_UPCOMING: SET"; fi
 
       - name: Run monitor (one-shot)
         env:
@@ -37,6 +38,7 @@ jobs:
           RUN_ONCE: 'true'
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
+          ROLE_ID_UPCOMING: ${{ secrets.ROLE_ID_UPCOMING }}
         run: |
           node monitor.js 2>&1 | tee monitor.log
 
