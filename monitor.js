@@ -25,13 +25,7 @@ const CONFIG = {
   TIMESTAMP_SELECTOR: process.env.TIMESTAMP_SELECTOR || '',
   SEEN_STORE: process.env.SEEN_STORE || 'seen.json',
   WEBHOOK_URL: process.env.DISCORD_WEBHOOK_URL,
-  ROLE_IDS: {
-    upcoming: process.env.ROLE_ID_UPCOMING,
-    paid: process.env.ROLE_ID_PAID,
-    regular: process.env.ROLE_ID_REGULAR,
-    abandoned: process.env.ROLE_ID_ABANDONED,
-    active: process.env.ROLE_ID_ACTIVE,
-  },
+  ROLE_ID_UPCOMING: process.env.ROLE_ID_UPCOMING || null,
   COLORS: {
     upcoming: Number(process.env.COLOR_UPCOMING || 3447003),
     paid: Number(process.env.COLOR_PAID || 16766720),
@@ -134,9 +128,9 @@ function idFromCard(card) {
 }
 function buildWebhookPayload(card) {
   const category = (card.category || 'regular').toLowerCase();
-  const roleId = CONFIG.ROLE_IDS[category] || null;
   const color = CONFIG.COLORS[category] || CONFIG.COLORS.regular;
-  const mention = roleId ? `<@&${roleId}>` : '';
+  // Only "upcoming" items ping the role — every other category posts silently.
+  const mention = (category === 'upcoming' && CONFIG.ROLE_ID_UPCOMING) ? `<@&${CONFIG.ROLE_ID_UPCOMING}>` : '';
   const embed = {
     title: card.title || 'UGC Item',
     url: card.link || undefined,
@@ -150,7 +144,11 @@ function buildWebhookPayload(card) {
   if (card.stock) embed.fields.push({ name: 'Stock', value: String(card.stock), inline: true });
   if (card.info) embed.fields.push({ name: 'Info', value: String(card.info).slice(0, 1024) });
   if (card.image) embed.image = { url: card.image };
-  return { content: mention, embeds: [embed] };
+  return {
+    content: mention,
+    embeds: [embed],
+    allowed_mentions: { roles: mention ? [CONFIG.ROLE_ID_UPCOMING] : [] },
+  };
 }
 async function postToDiscord(payload) {
   try {
@@ -321,4 +319,4 @@ async function runOnceMode() {
   console.error('Fatal error:', err);
   process.exit(1);
 });
-    
+  
