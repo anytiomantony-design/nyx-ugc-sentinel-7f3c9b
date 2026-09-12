@@ -25,7 +25,7 @@ const CONFIG = {
   TIMESTAMP_SELECTOR: process.env.TIMESTAMP_SELECTOR || '',
   SEEN_STORE: process.env.SEEN_STORE || 'seen.json',
   WEBHOOK_URL: process.env.DISCORD_WEBHOOK_URL,
-  ROLE_ID_UPCOMING: process.env.ROLE_ID_UPCOMING || null,
+  ROLE_ID_UPCOMING: '1531464694869786675',
   COLORS: {
     upcoming: Number(process.env.COLOR_UPCOMING || 3447003),
     paid: Number(process.env.COLOR_PAID || 16766720),
@@ -130,7 +130,7 @@ function buildWebhookPayload(card) {
   const category = (card.category || 'regular').toLowerCase();
   const color = CONFIG.COLORS[category] || CONFIG.COLORS.regular;
   // Only "upcoming" items ping the role — every other category posts silently.
-  const mention = (category === 'upcoming' && CONFIG.ROLE_ID_UPCOMING) ? `<@&${CONFIG.ROLE_ID_UPCOMING}>` : '';
+  const mention = CONFIG.ROLE_ID_UPCOMING ? `<@&${CONFIG.ROLE_ID_UPCOMING}>` : '';
   const embed = {
     title: card.title || 'UGC Item',
     url: card.link || undefined,
