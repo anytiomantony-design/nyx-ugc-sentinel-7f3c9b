@@ -17,7 +17,7 @@ const { chromium } = require('playwright');
 dotenv.config();
 
 const CONFIG = {
-  TARGET_URL: process.env.TARGET_URL || 'https://ugcleaks.short-term.workers.dev/leaks',
+  TARGET_URL: process.env.TARGET_URL || 'https://ugcleaks.vercel.app/leaks',
   POLL_INTERVAL_SECONDS: Number(process.env.POLL_INTERVAL_SECONDS || 30),
   CARD_SELECTOR: process.env.CARD_SELECTOR || '',
   TITLE_SELECTOR: process.env.TITLE_SELECTOR || '',
@@ -221,7 +221,7 @@ async function scrapeOnce(browser) {
       mainCandidates.forEach(n => candidateSet.add(n));
     }
     const makeCard = (el) => {
-      let title = el.querySelector('h2,h3,h1')?.innerText?.trim?.() || el.querySelector('strong')?.innerText?.trim?.() || (el.innerText||'').trim().split('\\n').map(s=>s.trim()).find(s=>s.length>2) || '';
+      let title = el.querySelector('h2,h3,h1')?.innerText?.trim?.() || el.querySelector('strong')?.innerText?.trim?.() || (el.innerText||'').trim().split('\n').map(s=>s.trim()).find(s=>s.length>0) || 'Item';
       const anchors = Array.from(el.querySelectorAll('a')).map(a=>a.href).filter(Boolean);
       const link = anchors.find(a=>a.includes('roblox.com')) || anchors.find(a=>a.includes('/leaks/')) || anchors[0] || '';
       const candidateT = Array.from(el.querySelectorAll('*')).find(n => {
