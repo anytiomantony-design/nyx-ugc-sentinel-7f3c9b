@@ -113,23 +113,14 @@ async function saveSeen(store, previousSha) {
 }
 
 // Build ID, embed, and post to Discord
-//
-// FIX: previously this fell back to `title + timestamp`. On this site the
-// "timestamp" text is often a live countdown (e.g. "2h 15m", "05:32") that
-// changes every few seconds, so the ID was never stable -> every card looked
-// "new" on every run -> everything got reposted every time.
-//
-// Now we key off title alone (normalized). Tradeoff accepted: if the site
-// ever reposts/restocks an item with the exact same title later, it will be
-// treated as already-seen and skipped.
 function idFromCard(card) {
   if (card.link) return card.link;
   return (card.title || '').trim().toLowerCase();
 }
+
 function buildWebhookPayload(card) {
   const category = (card.category || 'regular').toLowerCase();
   const color = CONFIG.COLORS[category] || CONFIG.COLORS.regular;
-  // Only "upcoming" items ping the role — every other category posts silently.
   const mention = CONFIG.ROLE_ID_UPCOMING ? `<@&${CONFIG.ROLE_ID_UPCOMING}>` : '';
   const embed = {
     title: card.title || 'UGC Item',
@@ -150,6 +141,7 @@ function buildWebhookPayload(card) {
     allowed_mentions: { roles: mention ? [CONFIG.ROLE_ID_UPCOMING] : [] },
   };
 }
+
 async function postToDiscord(payload) {
   try {
     await axios.post(CONFIG.WEBHOOK_URL, payload);
@@ -159,96 +151,101 @@ async function postToDiscord(payload) {
   }
 }
 
-// Scraping (same heuristics as earlier)
+// Scraping: Vercel page is client-rendered; wait for grid/cards to mount before parsing.
 async function scrapeOnce(browser) {
   const page = await browser.newPage();
-  await page.goto(CONFIG.TARGET_URL, { waitUntil: 'networkidle' }).catch(() => page.waitForLoadState('domcontentloaded'));
+  await page.goto(CONFIG.TARGET_URL, { waitUntil: 'domcontentloaded' }).catch(() => page.waitForLoadState('domcontentloaded'));
+  await page.waitForTimeout(5000);
 
-  // If CARD_SELECTOR provided, try it first
-  if (CONFIG.CARD_SELECTOR) {
+  const selectors = [
+    'div[class*="grid-cols"] > div',
+    'div[class*="grid"] > div',
+  ];
+
+  let cards = [];
+  for (const selector of selectors) {
     try {
-      const els = await page.$$(CONFIG.CARD_SELECTOR);
-      if (els.length > 0) {
-        const cards = await page.$$eval(CONFIG.CARD_SELECTOR, (els, cfg) => {
-          function pickText(el, sel) { if (!sel) return ''; const node = el.querySelector(sel); return node ? node.innerText.trim() : ''; }
-          function pickHref(el, sel) { if (!sel) return ''; const node = el.querySelector(sel); return node ? (node.href || node.getAttribute('href') || '') : ''; }
-          function pickImg(el) { const node = el.querySelector('img'); return node ? (node.src || node.getAttribute('data-src') || '') : ''; }
-          return els.map(el => ({
-            title: pickText(el, cfg.title) || (el.querySelector('h2')?.innerText?.trim?.() || el.querySelector('h3')?.innerText?.trim?.() || ''),
-            link: pickHref(el, cfg.link) || Array.from(el.querySelectorAll('a')).map(a=>a.href).find(Boolean) || '',
-            timestamp: pickText(el, cfg.timestamp) || '',
-            stock: pickText(el, '.stock') || '',
-            method: pickText(el, '.method') || '',
-            info: pickText(el, '.info') || '',
-            image: pickImg(el) || '',
-            category: el.getAttribute('data-category') || '',
-          }));
-        }, { title: CONFIG.TITLE_SELECTOR, link: CONFIG.LINK_SELECTOR, timestamp: CONFIG.TIMESTAMP_SELECTOR });
-        await page.close();
-        return cards;
+      const exists = await page.$(selector);
+      if (exists) {
+        cards = await page.$$eval(selector, (els) => {
+          return els
+            .map((el) => {
+              const text = (el.innerText || '').replace(/\s+/g, ' ').trim();
+              if (!text || text.length < 20) return null;
+
+              const lines = (el.innerText || '')
+                .split(/\n+/)
+                .map((s) => s.trim())
+                .filter(Boolean);
+
+              const title = lines[0] || '';
+              const stock = lines.find((line) => /stock/i.test(line)) || '';
+              const method = lines.find((line) => /method/i.test(line)) || '';
+              const release = lines.find((line) => /release/i.test(line)) || '';
+              const info = lines.find((line) => /info/i.test(line)) || '';
+              const link = Array.from(el.querySelectorAll('a')).map((a) => a.href).find(Boolean) || '';
+
+              return {
+                title: title || text.slice(0, 120),
+                link,
+                timestamp: release || '',
+                stock,
+                method,
+                info,
+                category: (el.getAttribute('data-category') || '').toLowerCase() || '',
+                description: text,
+              };
+            })
+            .filter(Boolean);
+        });
+        if (cards.length) {
+          await page.close();
+          return cards;
+        }
       }
-    } catch (e) {
-      console.warn('Primary selector extraction failed:', e.message || e);
+    } catch (err) {
+      console.warn('Card selector failed:', selector, err?.message || err);
     }
   }
 
-  // Heuristic fallback
-  console.log('No exact card selector or no matches — using heuristic detector.');
-  const heuristicKeywords = ['STOCK','METHOD','RELEASE','INFO','LIMIT','CLICK FOR DETAILS','RELEASE DATE','RELEASE:','CODE DROP'];
-
-  const cards = await page.evaluate((keywords) => {
-    function hasKeyword(node) { if (!node) return false; const txt=(node.innerText||'').toUpperCase(); return keywords.some(k=>txt.includes(k)); }
-    const hits = Array.from(document.querySelectorAll('body *')).filter(el => {
-      if (!el.offsetParent && el.clientHeight === 0 && el.clientWidth === 0) return false;
-      try { return hasKeyword(el); } catch { return false; }
-    });
-    const candidateSet = new Set();
-    for (const hit of hits) {
-      let ancestor = hit;
-      for (let i=0; i<6 && ancestor && ancestor.tagName !== 'BODY'; i++) {
-        const imgs = ancestor.querySelectorAll('img').length;
-        const links = ancestor.querySelectorAll('a').length;
-        const headings = ancestor.querySelectorAll('h1,h2,h3').length;
-        const textLen = (ancestor.innerText || '').length;
-        if ((imgs + links + headings) >= 1 && textLen > 20) { candidateSet.add(ancestor); break; }
-        ancestor = ancestor.parentElement;
+  // Final fallback: if the page still hasn't rendered card nodes, allow a bit more time and try again.
+  await page.waitForTimeout(5000);
+  for (const selector of selectors) {
+    try {
+      const exists = await page.$(selector);
+      if (exists) {
+        cards = await page.$$eval(selector, (els) => {
+          return els
+            .map((el) => {
+              const text = (el.innerText || '').replace(/\s+/g, ' ').trim();
+              if (!text || text.length < 20) return null;
+              const link = Array.from(el.querySelectorAll('a')).map((a) => a.href).find(Boolean) || '';
+              return {
+                title: text.split(/\s{2,}/)[0] || text.slice(0, 120),
+                link,
+                timestamp: '',
+                stock: '',
+                method: '',
+                info: text,
+                category: '',
+                description: text,
+              };
+            })
+            .filter(Boolean);
+        });
+        if (cards.length) {
+          await page.close();
+          return cards;
+        }
       }
-    }
-    if (candidateSet.size === 0) {
-      const mainCandidates = Array.from(document.querySelectorAll('main div, section div')).filter(n => {
-        const t = (n.innerText||'').length; return t > 100 && n.querySelectorAll('a,img').length >= 1;
-      }).slice(0,30);
-      mainCandidates.forEach(n => candidateSet.add(n));
-    }
-    const makeCard = (el) => {
-      let title = el.querySelector('h2,h3,h1')?.innerText?.trim?.() || el.querySelector('strong')?.innerText?.trim?.() || (el.innerText||'').trim().split('\n').map(s=>s.trim()).find(s=>s.length>0) || 'Item';
-      const anchors = Array.from(el.querySelectorAll('a')).map(a=>a.href).filter(Boolean);
-      const link = anchors.find(a=>a.includes('roblox.com')) || anchors.find(a=>a.includes('/leaks/')) || anchors[0] || '';
-      const candidateT = Array.from(el.querySelectorAll('*')).find(n => {
-        const t=(n.innerText||'').toLowerCase(); return t.includes('release') || t.includes('release date') || /\d{1,2}\s*(d|h|m|s)|\d{1,2}:\d{2}/.test(t);
-      });
-      const timestamp = candidateT ? candidateT.innerText.trim() : '';
-      const stock = Array.from(el.querySelectorAll('*')).find(n=>(n.innerText||'').toUpperCase().includes('STOCK'))?.innerText.trim() || '';
-      const method = Array.from(el.querySelectorAll('*')).find(n=>(n.innerText||'').toUpperCase().includes('METHOD'))?.innerText.trim() || '';
-      const info = (Array.from(el.querySelectorAll('*')).find(n=>(n.innerText||'').toUpperCase().includes('INFO')) || { innerText: '' }).innerText.trim() || '';
-      const img = el.querySelector('img'); const image = img ? (img.src || img.getAttribute('data-src') || '') : '';
-      let category = '';
-      const catNode = Array.from(el.querySelectorAll('*')).find(n => { const t=(n.innerText||'').toLowerCase(); return ['upcoming','active','paid','regular','abandoned'].some(k=>t.includes(k));});
-      if (catNode) category = (catNode.innerText||'').trim().toLowerCase();
-      return { title, link, timestamp, stock, method, info, image, category };
-    };
-    const result = []; candidateSet.forEach(el => { try { result.push(makeCard(el)); } catch {} });
-    const uniq = []; const seen = new Set();
-    for (const c of result) { const key = (c.link||'') + '||' + (c.title||'').slice(0,80); if (!seen.has(key)) { seen.add(key); uniq.push(c); } }
-    return uniq;
-  }, heuristicKeywords);
+    } catch {}
+  }
 
   await page.close();
-  return cards;
+  return [];
 }
 
 async function runOnceFlow(browser, seenState) {
-  // seenState = { store: { seen: [] }, sha }
   const items = await scrapeOnce(browser);
   const newItems = [];
   for (const card of items) {
@@ -265,7 +262,6 @@ async function runOnceFlow(browser, seenState) {
       await postToDiscord(payload);
       await new Promise(r => setTimeout(r, 750));
     }
-    // persist seen list
     const newSha = await saveSeen(seenState.store, seenState.sha);
     if (newSha) {
       seenState.sha = newSha;
@@ -319,4 +315,3 @@ async function runOnceMode() {
   console.error('Fatal error:', err);
   process.exit(1);
 });
-  
