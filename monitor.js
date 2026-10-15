@@ -5,14 +5,24 @@
  * - If GITHUB_TOKEN and GITHUB_REPOSITORY are present, it will load/save seen.json
  *   from/to the repository via the GitHub Contents API so state persists between runs.
  *
- * Requires: axios, dotenv, playwright
+ * This file uses playwright-extra + stealth plugin to reduce automation fingerprinting,
+ * launches a realistic desktop context (1920x1080), sets a desktop User-Agent and
+ * Accept-Language header, retries navigation while checking for challenge markers,
+ * and adds small randomized delays (jitter) between actions.
+ *
+ * Requires: axios, dotenv, playwright, playwright-extra, playwright-extra-plugin-stealth
  */
 
 const fs = require('fs');
 const path = require('path');
 const axios = require('axios');
 const dotenv = require('dotenv');
-const { chromium } = require('playwright');
+
+// stealth-enabled Playwright wrapper + plugin
+const playwright = require('playwright-extra');
+const StealthPlugin = require('playwright-extra-plugin-stealth');
+playwright.use(StealthPlugin());
+const { chromium } = playwright;
 
 dotenv.config();
 
@@ -25,7 +35,7 @@ const CONFIG = {
   TIMESTAMP_SELECTOR: process.env.TIMESTAMP_SELECTOR || '',
   SEEN_STORE: process.env.SEEN_STORE || 'seen.json',
   WEBHOOK_URL: process.env.DISCORD_WEBHOOK_URL,
-  ROLE_ID_UPCOMING: '1531464694869786675',
+  ROLE_ID_UPCOMING: process.env.ROLE_ID_UPCOMING || '1531464694869786675',
   COLORS: {
     upcoming: Number(process.env.COLOR_UPCOMING || 3447003),
     paid: Number(process.env.COLOR_PAID || 16766720),
@@ -36,6 +46,8 @@ const CONFIG = {
   GITHUB_TOKEN: process.env.GITHUB_TOKEN || null,
   GITHUB_REPOSITORY: process.env.GITHUB_REPOSITORY || null, // owner/repo
   DEBUG: (process.env.DEBUG || '').toLowerCase() === 'true',
+  USER_AGENT: process.env.USER_AGENT || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  ACCEPT_LANGUAGE: process.env.ACCEPT_LANGUAGE || 'en-US,en;q=0.9',
 };
 
 if (!CONFIG.WEBHOOK_URL) {
@@ -115,7 +127,6 @@ async function saveSeen(store, previousSha) {
 
 // Build ID, embed, and post to Discord
 function idFromCard(card) {
-  if (card.id) return card.id;
   if (card.link) return card.link;
   return (card.title || '').trim().toLowerCase();
 }
@@ -134,7 +145,6 @@ function buildWebhookPayload(card) {
   if (card.timestamp) embed.fields.push({ name: 'Release / Time', value: String(card.timestamp), inline: true });
   if (card.method) embed.fields.push({ name: 'Method', value: String(card.method), inline: true });
   if (card.stock) embed.fields.push({ name: 'Stock', value: String(card.stock), inline: true });
-  if (card.limit) embed.fields.push({ name: 'Limit', value: String(card.limit), inline: true });
   if (card.info) embed.fields.push({ name: 'Info', value: String(card.info).slice(0, 1024) });
   if (card.image) embed.image = { url: card.image };
   return {
@@ -152,6 +162,26 @@ async function postToDiscord(payload) {
   }
 }
 
+// Jitter helper: randomized delay to mimic human timing (1-3s default)
+function jitterDelay(minMs = 1000, maxMs = 3000) {
+  const ms = minMs + Math.floor(Math.random() * (maxMs - minMs + 1));
+  return new Promise(r => setTimeout(r, ms));
+}
+
+// Make browser with sane launch args
+async function makeBrowser() {
+  return await chromium.launch({
+    headless: true,
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-blink-features=AutomationControlled',
+      '--disable-dev-shm-usage',
+      '--disable-extensions',
+    ],
+  });
+}
+
 // Debug helpers
 async function saveDebugArtifacts(page) {
   if (!CONFIG.DEBUG) return;
@@ -164,6 +194,7 @@ async function saveDebugArtifacts(page) {
   }
 }
 
+// Attempt to click an "Upcoming" tab/button if present (helps surface specific listings)
 async function tryClickUpcomingTab(page) {
   try {
     const handle = await page.evaluateHandle(() => {
@@ -176,7 +207,7 @@ async function tryClickUpcomingTab(page) {
     });
     if (handle) {
       try { await handle.asElement().click(); } catch {}
-      await page.waitForTimeout(2500);
+      await page.waitForTimeout(1200 + Math.floor(Math.random() * 2000));
       return true;
     }
   } catch (e) {
@@ -185,82 +216,193 @@ async function tryClickUpcomingTab(page) {
   return false;
 }
 
-// Parse one card's innerText (labels and values are on separate lines)
-function parseCard(text, imgSrc) {
-  const lines = text.split(/\n+/).map(x => x.trim()).filter(Boolean);
-  const valueAfter = (label) => {
-    const i = lines.findIndex(l => new RegExp(label, 'i').test(l) && l.length < 20);
-    return i >= 0 ? (lines[i + 1] || '') : '';
-  };
-  const title = lines[0] || '';
-  const creator = (lines.find(l => /^by\s/i.test(l)) || '').replace(/^by\s+/i, '');
-  const method = valueAfter('method');
-  const stock = valueAfter('stock');
-  const limit = valueAfter('limit');
-  const release = valueAfter('release');
-  const infoIdx = lines.findIndex(l => /\binfo\b/i.test(l) && l.length < 20);
-  const info = infoIdx >= 0
-    ? lines.slice(infoIdx + 1).filter(l => !/click for details/i.test(l)).join(' ')
-    : '';
-  // Cards can share a name, so the ID mixes in creator, details and the image URL
-  const id = [title, creator, method, limit, release, imgSrc || '', info].join('|').toLowerCase();
-  return { id, title, link: '', timestamp: release, stock, method, limit, info, category: '', description: creator ? `by ${creator}` : '', image: '' };
-}
-
+// Collect cards using the configured selector (if provided). Keeps previous mapping logic.
 async function collectCardsFromPage(page) {
-  const SEL = CONFIG.CARD_SELECTOR || 'div[class*="blocky-shadow-hover"]';
-  await page.waitForSelector(SEL, { timeout: 20000 }).catch(() => console.log('Timed out waiting for cards:', SEL));
-  const raw = await page.$$eval(SEL, els => els.map(el => ({
-    text: el.innerText || '',
-    img: (el.querySelector('img') || {}).src || '',
-  }))).catch(() => []);
-  console.log('Card selector', SEL, 'matched', raw.length, 'card(s)');
-  return raw.map(r => parseCard(r.text, r.img)).filter(c => c.title);
+  const SEL = CONFIG.CARD_SELECTOR || '';
+  if (SEL) {
+    try {
+      const els = await page.$$(SEL);
+      if (els.length > 0) {
+        const cards = await page.$$eval(SEL, (els, cfg) => {
+          function pickText(el, sel) { if (!sel) return ''; const node = el.querySelector(sel); return node ? node.innerText.trim() : ''; }
+          function pickHref(el, sel) { if (!sel) return ''; const node = el.querySelector(sel); return node ? (node.href || node.getAttribute('href') || '') : ''; }
+          function pickImg(el) { const node = el.querySelector('img'); return node ? (node.src || node.getAttribute('data-src') || '') : ''; }
+          return els.map(el => ({
+            title: pickText(el, cfg.title) || (el.querySelector('h2')?.innerText?.trim?.() || el.querySelector('h3')?.innerText?.trim?.() || ''),
+            link: pickHref(el, cfg.link) || Array.from(el.querySelectorAll('a')).map(a=>a.href).find(Boolean) || '',
+            timestamp: pickText(el, cfg.timestamp) || '',
+            stock: pickText(el, '.stock') || '',
+            method: pickText(el, '.method') || '',
+            info: pickText(el, '.info') || '',
+            image: pickImg(el) || '',
+            category: el.getAttribute('data-category') || '',
+          }));
+        }, { title: CONFIG.TITLE_SELECTOR, link: CONFIG.LINK_SELECTOR, timestamp: CONFIG.TIMESTAMP_SELECTOR }).catch(() => []);
+        return cards;
+      }
+    } catch (e) {
+      console.warn('Primary selector extraction failed:', e.message || e);
+    }
+  }
+  return [];
 }
 
-// Scraping flow
+// Heuristic fallback (keeps your original DOM heuristics)
+async function heuristicDetect(page) {
+  const heuristicKeywords = ['STOCK','METHOD','RELEASE','INFO','LIMIT','CLICK FOR DETAILS','RELEASE DATE','RELEASE:','CODE DROP'];
+  const cards = await page.evaluate((keywords) => {
+    function hasKeyword(node) { if (!node) return false; const txt=(node.innerText||'').toUpperCase(); return keywords.some(k=>txt.includes(k)); }
+    const hits = Array.from(document.querySelectorAll('body *')).filter(el => {
+      if (!el.offsetParent && el.clientHeight === 0 && el.clientWidth === 0) return false;
+      try { return hasKeyword(el); } catch { return false; }
+    });
+    const candidateSet = new Set();
+    for (const hit of hits) {
+      let ancestor = hit;
+      for (let i=0; i<6 && ancestor && ancestor.tagName !== 'BODY'; i++) {
+        const imgs = ancestor.querySelectorAll('img').length;
+        const links = ancestor.querySelectorAll('a').length;
+        const headings = ancestor.querySelectorAll('h1,h2,h3').length;
+        const textLen = (ancestor.innerText || '').length;
+        if ((imgs + links + headings) >= 1 && textLen > 20) { candidateSet.add(ancestor); break; }
+        ancestor = ancestor.parentElement;
+      }
+    }
+    if (candidateSet.size === 0) {
+      const mainCandidates = Array.from(document.querySelectorAll('main div, section div')).filter(n => {
+        const t = (n.innerText||'').length; return t > 100 && n.querySelectorAll('a,img').length >= 1;
+      }).slice(0,30);
+      mainCandidates.forEach(n => candidateSet.add(n));
+    }
+    const makeCard = (el) => {
+      let title = el.querySelector('h2,h3,h1')?.innerText?.trim?.() || el.querySelector('strong')?.innerText?.trim?.() || (el.innerText||'').trim().split('\n').map(s=>s.trim()).find(s=>s.length>0) || '';
+      const anchors = Array.from(el.querySelectorAll('a')).map(a=>a.href).filter(Boolean);
+      const link = anchors.find(a=>a.includes('roblox.com')) || anchors.find(a=>a.includes('/leaks/')) || anchors[0] || '';
+      const candidateT = Array.from(el.querySelectorAll('*')).find(n => {
+        const t=(n.innerText||'').toLowerCase(); return t.includes('release') || t.includes('release date') || /\d{1,2}\s*(d|h|m|s)|\d{1,2}:\d{2}/.test(t);
+      });
+      const timestamp = candidateT ? candidateT.innerText.trim() : '';
+      const stock = Array.from(el.querySelectorAll('*')).find(n=>(n.innerText||'').toUpperCase().includes('STOCK'))?.innerText.trim() || '';
+      const method = Array.from(el.querySelectorAll('*')).find(n=>(n.innerText||'').toUpperCase().includes('METHOD'))?.innerText.trim() || '';
+      const info = (Array.from(el.querySelectorAll('*')).find(n=>(n.innerText||'').toUpperCase().includes('INFO')) || { innerText: '' }).innerText.trim() || '';
+      const img = el.querySelector('img'); const image = img ? (img.src || img.getAttribute('data-src') || '') : '';
+      let category = '';
+      const catNode = Array.from(el.querySelectorAll('*')).find(n => { const t=(n.innerText||'').toLowerCase(); return ['upcoming','active','paid','regular','abandoned'].some(k=>t.includes(k));});
+      if (catNode) category = (catNode.innerText||'').trim().toLowerCase();
+      return { title, link, timestamp, stock, method, info, image, category };
+    };
+    const result = []; candidateSet.forEach(el => { try { result.push(makeCard(el)); } catch {} });
+    const uniq = []; const seen = new Set();
+    for (const c of result) { const key = (c.link||'') + '||' + (c.title||'').slice(0,80); if (!seen.has(key)) { seen.add(key); uniq.push(c); } }
+    return uniq;
+  }, heuristicKeywords);
+  return cards;
+}
+
+// Scraping flow with stealthy context, retry loop for challenges, and jitter
 async function scrapeOnce(browser) {
-  const page = await browser.newPage();
-  const problems = [];
-  const apiCalls = [];
-  page.on('response', r => { if (r.status() >= 400) problems.push(`${r.status()} ${r.url().slice(0, 140)}`); });
-  page.on('requestfailed', r => problems.push(`FAILED ${r.url().slice(0, 140)} ${(r.failure() || {}).errorText || ''}`));
-  page.on('console', m => { if (m.type() === 'error') problems.push(`console: ${m.text().slice(0, 160)}`); });
-  page.on('request', r => { if (['xhr', 'fetch'].includes(r.resourceType())) apiCalls.push(`${r.method()} ${r.url().slice(0, 140)}`); });
+  const context = await browser.newContext({
+    viewport: { width: 1920, height: 1080 },
+    userAgent: CONFIG.USER_AGENT,
+    locale: CONFIG.ACCEPT_LANGUAGE.split(',')[0] || 'en-US',
+  });
 
-  const resp = await page.goto(CONFIG.TARGET_URL, { waitUntil: 'domcontentloaded' })
-    .catch(e => { console.warn('goto failed:', e?.message || e); return null; });
-  console.log('HTTP status:', resp ? resp.status() : 'no response', '| final URL:', page.url(), '| title:', JSON.stringify(await page.title().catch(() => '')));
-  await page.setViewportSize({ width: 1400, height: 2200 });
-  await page.waitForTimeout(5000);
-  if (CONFIG.DEBUG) await saveDebugArtifacts(page);
+  // set extra headers
+  await context.setExtraHTTPHeaders({
+    'accept-language': CONFIG.ACCEPT_LANGUAGE,
+    'referer': CONFIG.TARGET_URL,
+  });
 
+  // inject small init script to override automation flags
+  await context.addInitScript(() => {
+    try {
+      Object.defineProperty(navigator, 'webdriver', { get: () => false });
+    } catch (e) {}
+    try { Object.defineProperty(navigator, 'languages', { get: () => ['en-US','en'] }); } catch (e) {}
+    try { Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] }); } catch (e) {}
+    try { window.chrome = window.chrome || { runtime: {} }; } catch (e) {}
+    try {
+      const orig = navigator.permissions && navigator.permissions.query;
+      if (orig) {
+        navigator.permissions.query = (parameters) => {
+          if (parameters && parameters.name === 'notifications') {
+            return Promise.resolve({ state: Notification.permission });
+          }
+          return orig(parameters);
+        };
+      }
+    } catch (e) {}
+  });
+
+  const page = await context.newPage();
+
+  // response logging for debugging (prints 4xx/5xx and a body preview)
+  page.on('response', async (res) => {
+    try {
+      const status = res.status();
+      if (status >= 400) {
+        const ct = (res.headers()['content-type'] || '').toLowerCase();
+        let bodyPreview = '';
+        if (ct.includes('json') || ct.includes('text') || ct.includes('html')) {
+          bodyPreview = (await res.text().catch(() => '')).slice(0, 300);
+        }
+        console.warn('HTTP', status, res.url(), bodyPreview ? `BODY_PREVIEW: ${bodyPreview}` : '');
+      }
+    } catch (e) { /* ignore */ }
+  });
+
+  // navigation (domcontentloaded) + retry/poll loop for challenge clearance
+  await page.goto(CONFIG.TARGET_URL, { waitUntil: 'domcontentloaded' }).catch(() => null);
+
+  const start = Date.now();
+  const timeout = 10000; // 10s
+  let challengeCleared = false;
+  while (Date.now() - start < timeout) {
+    await jitterDelay(500, 1200);
+    const title = await page.title().catch(() => '');
+    const bodyText = (await page.evaluate(() => document.body ? document.body.innerText : '').catch(() => '')).toString();
+    const markerRegex = /\b(just a moment|checking your browser|access denied|verify|captcha|attention required)\b/i;
+    if (!markerRegex.test(title) && !markerRegex.test(bodyText)) { challengeCleared = true; break; }
+  }
+  if (!challengeCleared) {
+    console.warn('Challenge/verification may still be present after timeout; continuing to attempt parsing (may be blocked).');
+  } else if (CONFIG.DEBUG) {
+    console.log('Challenge cleared — proceeding to parse DOM.');
+  }
+
+  // small random delay before parsing
+  await jitterDelay(1000, 3000);
+
+  // Try configured selector first
   let cards = await collectCardsFromPage(page);
+
+  // If no cards found, attempt to click Upcoming tab and re-collect
   if (!cards.length) {
-    console.log('No cards found yet; trying to click the Upcoming tab...');
     const clicked = await tryClickUpcomingTab(page);
     if (clicked) {
-      await page.waitForTimeout(2500);
+      await jitterDelay(1000, 2500);
       cards = await collectCardsFromPage(page);
     }
   }
 
+  // Heuristic fallback
   if (!cards.length) {
-    // Diagnostics: what did the runner actually receive?
-    const body = await page.evaluate(() => (document.body ? document.body.innerText : '').replace(/\s+/g, ' ').slice(0, 500)).catch(() => '');
-    console.log('DIAG body text:', JSON.stringify(body));
-    console.log('DIAG api calls (first 10):', apiCalls.slice(0, 10));
-    console.log('DIAG problems (first 15):', problems.slice(0, 15));
-    if (CONFIG.DEBUG) await saveDebugArtifacts(page);
+    console.log('No exact card selector or no matches — using heuristic detector.');
+    cards = await heuristicDetect(page);
   }
 
+  // Save debug artifacts optionally
+  if (CONFIG.DEBUG) await saveDebugArtifacts(page);
+
   await page.close();
+  await context.close();
+
   return cards;
 }
 
 async function runOnceFlow(browser, seenState) {
+  // seenState = { store: { seen: [] }, sha }
   const items = await scrapeOnce(browser);
-  if (!items.length) { console.log('No cards found on the page.'); return; }
   const newItems = [];
   for (const card of items) {
     const id = idFromCard(card);
@@ -269,33 +411,27 @@ async function runOnceFlow(browser, seenState) {
       seenState.store.seen.push(id);
     }
   }
-  // One-time migration: the ID format changed, so the first run (store without version 2)
-  // records every current card as seen WITHOUT posting. SEED_ONLY=true forces this manually.
-  const needsSeed = process.env.SEED_ONLY === 'true' || seenState.store.version !== 2;
-  if (needsSeed) {
-    seenState.store.version = 2;
-    console.log('Seeding: marking', newItems.length, 'card(s) as seen without posting (', seenState.store.seen.length, 'total ).');
-    const sha = await saveSeen(seenState.store, seenState.sha);
-    if (sha) seenState.sha = sha;
-    else if (CONFIG.GITHUB_TOKEN && CONFIG.GITHUB_REPOSITORY) console.error('WARNING: seeding could not be saved to GitHub.');
-    return;
-  }
   if (newItems.length) {
     console.log('Found', newItems.length, 'new item(s). Posting...');
     for (const it of newItems) {
       const payload = buildWebhookPayload(it);
       await postToDiscord(payload);
-      await new Promise(r=>setTimeout(r,750));
+      await new Promise(r => setTimeout(r, 750));
     }
+    // persist seen list
     const newSha = await saveSeen(seenState.store, seenState.sha);
-    if (newSha) seenState.sha = newSha; else if (CONFIG.GITHUB_TOKEN && CONFIG.GITHUB_REPOSITORY) console.error('WARNING: seen.json failed to persist to GitHub — next run will likely repost these items.');
+    if (newSha) {
+      seenState.sha = newSha;
+    } else if (CONFIG.GITHUB_TOKEN && CONFIG.GITHUB_REPOSITORY) {
+      console.error('WARNING: seen.json failed to persist to GitHub — next run will likely repost these items.');
+    }
   } else {
     console.log('No new items.');
   }
 }
 
 async function runLoopMode() {
-  const browser = await chromium.launch({ headless: true });
+  const browser = await makeBrowser();
   try {
     while (true) {
       try {
@@ -305,7 +441,7 @@ async function runLoopMode() {
       } catch (err) {
         console.error('Loop error:', err?.message || err);
       }
-      await new Promise(r=>setTimeout(r, CONFIG.POLL_INTERVAL_SECONDS*1000));
+      await new Promise(r => setTimeout(r, CONFIG.POLL_INTERVAL_SECONDS * 1000));
     }
   } finally {
     await browser.close();
@@ -313,7 +449,7 @@ async function runLoopMode() {
 }
 
 async function runOnceMode() {
-  const browser = await chromium.launch({ headless: true });
+  const browser = await makeBrowser();
   try {
     const seenState = await loadSeen();
     console.log('One-shot: Checking', CONFIG.TARGET_URL, 'at', new Date().toISOString());
@@ -324,9 +460,15 @@ async function runOnceMode() {
 }
 
 // Entrypoint
-(async()=>{
-  const runOnceEnv = (process.env.RUN_ONCE||'').toLowerCase() === 'true';
-  if (runOnceEnv) { await runOnceMode(); process.exit(0); } else { await runLoopMode(); }
-})().catch(err=>{ console.error('Fatal error:', err); process.exit(1); });
-
-                                
+(async () => {
+  const runOnceEnv = (process.env.RUN_ONCE || '').toLowerCase() === 'true';
+  if (runOnceEnv) {
+    await runOnceMode();
+    process.exit(0);
+  } else {
+    await runLoopMode();
+  }
+})().catch(err => {
+  console.error('Fatal error:', err);
+  process.exit(1);
+});
