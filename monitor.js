@@ -115,6 +115,7 @@ async function saveSeen(store, previousSha) {
 
 // Build ID, embed, and post to Discord
 function idFromCard(card) {
+  if (card.id) return card.id;
   if (card.link) return card.link;
   return (card.title || '').trim().toLowerCase();
 }
@@ -133,6 +134,7 @@ function buildWebhookPayload(card) {
   if (card.timestamp) embed.fields.push({ name: 'Release / Time', value: String(card.timestamp), inline: true });
   if (card.method) embed.fields.push({ name: 'Method', value: String(card.method), inline: true });
   if (card.stock) embed.fields.push({ name: 'Stock', value: String(card.stock), inline: true });
+  if (card.limit) embed.fields.push({ name: 'Limit', value: String(card.limit), inline: true });
   if (card.info) embed.fields.push({ name: 'Info', value: String(card.info).slice(0, 1024) });
   if (card.image) embed.image = { url: card.image };
   return {
@@ -183,40 +185,37 @@ async function tryClickUpcomingTab(page) {
   return false;
 }
 
+// Parse one card's innerText (labels and values are on separate lines)
+function parseCard(text, imgSrc) {
+  const lines = text.split(/\n+/).map(x => x.trim()).filter(Boolean);
+  const valueAfter = (label) => {
+    const i = lines.findIndex(l => new RegExp(label, 'i').test(l) && l.length < 20);
+    return i >= 0 ? (lines[i + 1] || '') : '';
+  };
+  const title = lines[0] || '';
+  const creator = (lines.find(l => /^by\s/i.test(l)) || '').replace(/^by\s+/i, '');
+  const method = valueAfter('method');
+  const stock = valueAfter('stock');
+  const limit = valueAfter('limit');
+  const release = valueAfter('release');
+  const infoIdx = lines.findIndex(l => /\binfo\b/i.test(l) && l.length < 20);
+  const info = infoIdx >= 0
+    ? lines.slice(infoIdx + 1).filter(l => !/click for details/i.test(l)).join(' ')
+    : '';
+  // Cards can share a name, so the ID mixes in creator, details and the image URL
+  const id = [title, creator, method, limit, release, imgSrc || '', info].join('|').toLowerCase();
+  return { id, title, link: '', timestamp: release, stock, method, limit, info, category: '', description: creator ? `by ${creator}` : '', image: '' };
+}
+
 async function collectCardsFromPage(page) {
-  const selectors = [
-    'div[class*="grid-cols"] > div',
-    'div[class*="grid"] > div',
-  ];
-  for (const selector of selectors) {
-    try {
-      const count = await page.$$eval(selector, els => els.length).catch(() => 0);
-      if (!count) {
-        console.log('No elements matched selector:', selector);
-        continue;
-      }
-      const sample = await page.$$eval(selector, els => els.slice(0,5).map(e=> (e.innerText||'').replace(/\s+/g,' ').trim()));
-      console.log('Selector', selector, 'matched', count, 'items. Sample:', sample.slice(0,3));
-
-      const cards = await page.$$eval(selector, els => els.map(el => {
-        const text = (el.innerText || '').replace(/\s+/g, ' ').trim();
-        if (!text || text.length < 20) return null;
-        const lines = (el.innerText || '').split(/\n+/).map(s=>s.trim()).filter(Boolean);
-        const title = lines[0] || text.slice(0,120);
-        const stock = lines.find(l=>/stock/i.test(l))||'';
-        const method = lines.find(l=>/method/i.test(l))||'';
-        const release = lines.find(l=>/release/i.test(l))||'';
-        const info = lines.find(l=>/info/i.test(l))||'';
-        const link = Array.from(el.querySelectorAll('a')).map(a=>a.href).find(Boolean)||'';
-        return { title, link, timestamp: release||'', stock, method, info, category: (el.getAttribute('data-category')||'').toLowerCase()||'', description: text };
-      }).filter(Boolean)).catch(()=>[]);
-
-      if (cards && cards.length) return cards;
-    } catch (e) {
-      console.warn('Selector eval failed for', selector, e?.message || e);
-    }
-  }
-  return [];
+  const SEL = CONFIG.CARD_SELECTOR || 'div[class*="blocky-shadow-hover"]';
+  await page.waitForSelector(SEL, { timeout: 20000 }).catch(() => console.log('Timed out waiting for cards:', SEL));
+  const raw = await page.$$eval(SEL, els => els.map(el => ({
+    text: el.innerText || '',
+    img: (el.querySelector('img') || {}).src || '',
+  }))).catch(() => []);
+  console.log('Card selector', SEL, 'matched', raw.length, 'card(s)');
+  return raw.map(r => parseCard(r.text, r.img)).filter(c => c.title);
 }
 
 // Scraping flow
@@ -255,6 +254,11 @@ async function runOnceFlow(browser, seenState) {
       newItems.push(card);
       seenState.store.seen.push(id);
     }
+  }
+  if (process.env.SEED_ONLY === 'true') {
+    console.log('SEED_ONLY: marking', newItems.length, 'item(s) as seen without posting.');
+    await saveSeen(seenState.store, seenState.sha);
+    return;
   }
   if (newItems.length) {
     console.log('Found', newItems.length, 'new item(s). Posting...');
