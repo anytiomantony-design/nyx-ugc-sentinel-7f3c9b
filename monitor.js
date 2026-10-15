@@ -221,7 +221,16 @@ async function collectCardsFromPage(page) {
 // Scraping flow
 async function scrapeOnce(browser) {
   const page = await browser.newPage();
-  await page.goto(CONFIG.TARGET_URL, { waitUntil: 'domcontentloaded' }).catch(()=>page.waitForLoadState('domcontentloaded'));
+  const problems = [];
+  const apiCalls = [];
+  page.on('response', r => { if (r.status() >= 400) problems.push(`${r.status()} ${r.url().slice(0, 140)}`); });
+  page.on('requestfailed', r => problems.push(`FAILED ${r.url().slice(0, 140)} ${(r.failure() || {}).errorText || ''}`));
+  page.on('console', m => { if (m.type() === 'error') problems.push(`console: ${m.text().slice(0, 160)}`); });
+  page.on('request', r => { if (['xhr', 'fetch'].includes(r.resourceType())) apiCalls.push(`${r.method()} ${r.url().slice(0, 140)}`); });
+
+  const resp = await page.goto(CONFIG.TARGET_URL, { waitUntil: 'domcontentloaded' })
+    .catch(e => { console.warn('goto failed:', e?.message || e); return null; });
+  console.log('HTTP status:', resp ? resp.status() : 'no response', '| final URL:', page.url(), '| title:', JSON.stringify(await page.title().catch(() => '')));
   await page.setViewportSize({ width: 1400, height: 2200 });
   await page.waitForTimeout(5000);
   if (CONFIG.DEBUG) await saveDebugArtifacts(page);
@@ -236,9 +245,13 @@ async function scrapeOnce(browser) {
     }
   }
 
-  if (!cards.length && CONFIG.DEBUG) {
-    console.log('No cards resolved after fallback; capturing final debug artifacts.');
-    await saveDebugArtifacts(page);
+  if (!cards.length) {
+    // Diagnostics: what did the runner actually receive?
+    const body = await page.evaluate(() => (document.body ? document.body.innerText : '').replace(/\s+/g, ' ').slice(0, 500)).catch(() => '');
+    console.log('DIAG body text:', JSON.stringify(body));
+    console.log('DIAG api calls (first 10):', apiCalls.slice(0, 10));
+    console.log('DIAG problems (first 15):', problems.slice(0, 15));
+    if (CONFIG.DEBUG) await saveDebugArtifacts(page);
   }
 
   await page.close();
@@ -315,4 +328,5 @@ async function runOnceMode() {
   const runOnceEnv = (process.env.RUN_ONCE||'').toLowerCase() === 'true';
   if (runOnceEnv) { await runOnceMode(); process.exit(0); } else { await runLoopMode(); }
 })().catch(err=>{ console.error('Fatal error:', err); process.exit(1); });
-  
+
+                                
