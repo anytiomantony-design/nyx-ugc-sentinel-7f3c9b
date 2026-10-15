@@ -247,6 +247,7 @@ async function scrapeOnce(browser) {
 
 async function runOnceFlow(browser, seenState) {
   const items = await scrapeOnce(browser);
+  if (!items.length) { console.log('No cards found on the page.'); return; }
   const newItems = [];
   for (const card of items) {
     const id = idFromCard(card);
@@ -255,9 +256,15 @@ async function runOnceFlow(browser, seenState) {
       seenState.store.seen.push(id);
     }
   }
-  if (process.env.SEED_ONLY === 'true') {
-    console.log('SEED_ONLY: marking', newItems.length, 'item(s) as seen without posting.');
-    await saveSeen(seenState.store, seenState.sha);
+  // One-time migration: the ID format changed, so the first run (store without version 2)
+  // records every current card as seen WITHOUT posting. SEED_ONLY=true forces this manually.
+  const needsSeed = process.env.SEED_ONLY === 'true' || seenState.store.version !== 2;
+  if (needsSeed) {
+    seenState.store.version = 2;
+    console.log('Seeding: marking', newItems.length, 'card(s) as seen without posting (', seenState.store.seen.length, 'total ).');
+    const sha = await saveSeen(seenState.store, seenState.sha);
+    if (sha) seenState.sha = sha;
+    else if (CONFIG.GITHUB_TOKEN && CONFIG.GITHUB_REPOSITORY) console.error('WARNING: seeding could not be saved to GitHub.');
     return;
   }
   if (newItems.length) {
@@ -308,3 +315,4 @@ async function runOnceMode() {
   const runOnceEnv = (process.env.RUN_ONCE||'').toLowerCase() === 'true';
   if (runOnceEnv) { await runOnceMode(); process.exit(0); } else { await runLoopMode(); }
 })().catch(err=>{ console.error('Fatal error:', err); process.exit(1); });
+  
