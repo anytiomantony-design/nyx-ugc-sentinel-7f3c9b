@@ -35,6 +35,7 @@ const CONFIG = {
   },
   GITHUB_TOKEN: process.env.GITHUB_TOKEN || null,
   GITHUB_REPOSITORY: process.env.GITHUB_REPOSITORY || null, // owner/repo
+  DEBUG: (process.env.DEBUG || '').toLowerCase() === 'true',
 };
 
 if (!CONFIG.WEBHOOK_URL) {
@@ -117,7 +118,6 @@ function idFromCard(card) {
   if (card.link) return card.link;
   return (card.title || '').trim().toLowerCase();
 }
-
 function buildWebhookPayload(card) {
   const category = (card.category || 'regular').toLowerCase();
   const color = CONFIG.COLORS[category] || CONFIG.COLORS.regular;
@@ -141,7 +141,6 @@ function buildWebhookPayload(card) {
     allowed_mentions: { roles: mention ? [CONFIG.ROLE_ID_UPCOMING] : [] },
   };
 }
-
 async function postToDiscord(payload) {
   try {
     await axios.post(CONFIG.WEBHOOK_URL, payload);
@@ -151,98 +150,100 @@ async function postToDiscord(payload) {
   }
 }
 
-// Scraping: Vercel page is client-rendered; wait for grid/cards to mount before parsing.
-async function scrapeOnce(browser) {
-  const page = await browser.newPage();
-  await page.goto(CONFIG.TARGET_URL, { waitUntil: 'domcontentloaded' }).catch(() => page.waitForLoadState('domcontentloaded'));
-  await page.waitForTimeout(5000);
+// Debug helpers
+async function saveDebugArtifacts(page) {
+  if (!CONFIG.DEBUG) return;
+  try {
+    await page.screenshot({ path: 'debug.png', fullPage: true });
+    fs.writeFileSync('debug.html', await page.content());
+    console.log('Saved debug.png and debug.html');
+  } catch (e) {
+    console.warn('Debug artifact save failed:', e?.message || e);
+  }
+}
 
+async function tryClickUpcomingTab(page) {
+  try {
+    const handle = await page.evaluateHandle(() => {
+      const nodes = Array.from(document.querySelectorAll('button, a'));
+      for (const el of nodes) {
+        const text = (el.innerText || '').trim();
+        if (/\bupcoming\b/i.test(text)) return el;
+      }
+      return null;
+    });
+    if (handle) {
+      try { await handle.asElement().click(); } catch {}
+      await page.waitForTimeout(2500);
+      return true;
+    }
+  } catch (e) {
+    console.warn('Upcoming tab click failed:', e?.message || e);
+  }
+  return false;
+}
+
+async function collectCardsFromPage(page) {
   const selectors = [
     'div[class*="grid-cols"] > div',
     'div[class*="grid"] > div',
   ];
-
-  let cards = [];
   for (const selector of selectors) {
     try {
-      const exists = await page.$(selector);
-      if (exists) {
-        cards = await page.$$eval(selector, (els) => {
-          return els
-            .map((el) => {
-              const text = (el.innerText || '').replace(/\s+/g, ' ').trim();
-              if (!text || text.length < 20) return null;
-
-              const lines = (el.innerText || '')
-                .split(/\n+/)
-                .map((s) => s.trim())
-                .filter(Boolean);
-
-              const title = lines[0] || '';
-              const stock = lines.find((line) => /stock/i.test(line)) || '';
-              const method = lines.find((line) => /method/i.test(line)) || '';
-              const release = lines.find((line) => /release/i.test(line)) || '';
-              const info = lines.find((line) => /info/i.test(line)) || '';
-              const link = Array.from(el.querySelectorAll('a')).map((a) => a.href).find(Boolean) || '';
-
-              return {
-                title: title || text.slice(0, 120),
-                link,
-                timestamp: release || '',
-                stock,
-                method,
-                info,
-                category: (el.getAttribute('data-category') || '').toLowerCase() || '',
-                description: text,
-              };
-            })
-            .filter(Boolean);
-        });
-        if (cards.length) {
-          await page.close();
-          return cards;
-        }
+      const count = await page.$$eval(selector, els => els.length).catch(() => 0);
+      if (!count) {
+        console.log('No elements matched selector:', selector);
+        continue;
       }
-    } catch (err) {
-      console.warn('Card selector failed:', selector, err?.message || err);
+      const sample = await page.$$eval(selector, els => els.slice(0,5).map(e=> (e.innerText||'').replace(/\s+/g,' ').trim()));
+      console.log('Selector', selector, 'matched', count, 'items. Sample:', sample.slice(0,3));
+
+      const cards = await page.$$eval(selector, els => els.map(el => {
+        const text = (el.innerText || '').replace(/\s+/g, ' ').trim();
+        if (!text || text.length < 20) return null;
+        const lines = (el.innerText || '').split(/\n+/).map(s=>s.trim()).filter(Boolean);
+        const title = lines[0] || text.slice(0,120);
+        const stock = lines.find(l=>/stock/i.test(l))||'';
+        const method = lines.find(l=>/method/i.test(l))||'';
+        const release = lines.find(l=>/release/i.test(l))||'';
+        const info = lines.find(l=>/info/i.test(l))||'';
+        const link = Array.from(el.querySelectorAll('a')).map(a=>a.href).find(Boolean)||'';
+        return { title, link, timestamp: release||'', stock, method, info, category: (el.getAttribute('data-category')||'').toLowerCase()||'', description: text };
+      }).filter(Boolean)).catch(()=>[]);
+
+      if (cards && cards.length) return cards;
+    } catch (e) {
+      console.warn('Selector eval failed for', selector, e?.message || e);
+    }
+  }
+  return [];
+}
+
+// Scraping flow
+async function scrapeOnce(browser) {
+  const page = await browser.newPage();
+  await page.goto(CONFIG.TARGET_URL, { waitUntil: 'domcontentloaded' }).catch(()=>page.waitForLoadState('domcontentloaded'));
+  await page.setViewportSize({ width: 1400, height: 2200 });
+  await page.waitForTimeout(5000);
+  if (CONFIG.DEBUG) await saveDebugArtifacts(page);
+
+  let cards = await collectCardsFromPage(page);
+  if (!cards.length) {
+    console.log('No cards found yet; trying to click the Upcoming tab...');
+    const clicked = await tryClickUpcomingTab(page);
+    if (clicked) {
+      await page.waitForTimeout(2500);
+      cards = await collectCardsFromPage(page);
     }
   }
 
-  // Final fallback: if the page still hasn't rendered card nodes, allow a bit more time and try again.
-  await page.waitForTimeout(5000);
-  for (const selector of selectors) {
-    try {
-      const exists = await page.$(selector);
-      if (exists) {
-        cards = await page.$$eval(selector, (els) => {
-          return els
-            .map((el) => {
-              const text = (el.innerText || '').replace(/\s+/g, ' ').trim();
-              if (!text || text.length < 20) return null;
-              const link = Array.from(el.querySelectorAll('a')).map((a) => a.href).find(Boolean) || '';
-              return {
-                title: text.split(/\s{2,}/)[0] || text.slice(0, 120),
-                link,
-                timestamp: '',
-                stock: '',
-                method: '',
-                info: text,
-                category: '',
-                description: text,
-              };
-            })
-            .filter(Boolean);
-        });
-        if (cards.length) {
-          await page.close();
-          return cards;
-        }
-      }
-    } catch {}
+  if (!cards.length && CONFIG.DEBUG) {
+    console.log('No cards resolved after fallback; capturing final debug artifacts.');
+    await saveDebugArtifacts(page);
   }
 
   await page.close();
-  return [];
+  return cards;
 }
 
 async function runOnceFlow(browser, seenState) {
@@ -260,14 +261,10 @@ async function runOnceFlow(browser, seenState) {
     for (const it of newItems) {
       const payload = buildWebhookPayload(it);
       await postToDiscord(payload);
-      await new Promise(r => setTimeout(r, 750));
+      await new Promise(r=>setTimeout(r,750));
     }
     const newSha = await saveSeen(seenState.store, seenState.sha);
-    if (newSha) {
-      seenState.sha = newSha;
-    } else if (CONFIG.GITHUB_TOKEN && CONFIG.GITHUB_REPOSITORY) {
-      console.error('WARNING: seen.json failed to persist to GitHub — next run will likely repost these items.');
-    }
+    if (newSha) seenState.sha = newSha; else if (CONFIG.GITHUB_TOKEN && CONFIG.GITHUB_REPOSITORY) console.error('WARNING: seen.json failed to persist to GitHub — next run will likely repost these items.');
   } else {
     console.log('No new items.');
   }
@@ -284,7 +281,7 @@ async function runLoopMode() {
       } catch (err) {
         console.error('Loop error:', err?.message || err);
       }
-      await new Promise(r => setTimeout(r, CONFIG.POLL_INTERVAL_SECONDS * 1000));
+      await new Promise(r=>setTimeout(r, CONFIG.POLL_INTERVAL_SECONDS*1000));
     }
   } finally {
     await browser.close();
@@ -303,15 +300,7 @@ async function runOnceMode() {
 }
 
 // Entrypoint
-(async () => {
-  const runOnceEnv = (process.env.RUN_ONCE || '').toLowerCase() === 'true';
-  if (runOnceEnv) {
-    await runOnceMode();
-    process.exit(0);
-  } else {
-    await runLoopMode();
-  }
-})().catch(err => {
-  console.error('Fatal error:', err);
-  process.exit(1);
-});
+(async()=>{
+  const runOnceEnv = (process.env.RUN_ONCE||'').toLowerCase() === 'true';
+  if (runOnceEnv) { await runOnceMode(); process.exit(0); } else { await runLoopMode(); }
+})().catch(err=>{ console.error('Fatal error:', err); process.exit(1); });
