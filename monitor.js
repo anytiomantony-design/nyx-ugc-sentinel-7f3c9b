@@ -5,24 +5,19 @@
  * - If GITHUB_TOKEN and GITHUB_REPOSITORY are present, it will load/save seen.json
  *   from/to the repository via the GitHub Contents API so state persists between runs.
  *
- * This file uses playwright-extra + stealth plugin to reduce automation fingerprinting,
- * launches a realistic desktop context (1920x1080), sets a desktop User-Agent and
- * Accept-Language header, retries navigation while checking for challenge markers,
- * and adds small randomized delays (jitter) between actions.
+ * This file uses plain Playwright with init scripts to reduce automation fingerprinting.
+ * It also includes a fallback that attempts to fetch the site's JSON/XHR endpoints
+ * (including Next.js /_next/data/* JSON pages and /api/* endpoints) so the scraper
+ * can run from CI without proxies when possible.
  *
- * Requires: axios, dotenv, playwright, playwright-extra, playwright-extra-plugin-stealth
+ * Requires: axios, dotenv, playwright
  */
 
 const fs = require('fs');
 const path = require('path');
 const axios = require('axios');
 const dotenv = require('dotenv');
-
-// stealth-enabled Playwright wrapper + plugin
-const playwright = require('playwright-extra');
-const StealthPlugin = require('playwright-extra-plugin-stealth');
-playwright.use(StealthPlugin());
-const { chromium } = playwright;
+const { chromium } = require('playwright');
 
 dotenv.config();
 
@@ -145,6 +140,7 @@ function buildWebhookPayload(card) {
   if (card.timestamp) embed.fields.push({ name: 'Release / Time', value: String(card.timestamp), inline: true });
   if (card.method) embed.fields.push({ name: 'Method', value: String(card.method), inline: true });
   if (card.stock) embed.fields.push({ name: 'Stock', value: String(card.stock), inline: true });
+  if (card.limit) embed.fields.push({ name: 'Limit', value: String(card.limit), inline: true });
   if (card.info) embed.fields.push({ name: 'Info', value: String(card.info).slice(0, 1024) });
   if (card.image) embed.image = { url: card.image };
   return {
@@ -216,7 +212,28 @@ async function tryClickUpcomingTab(page) {
   return false;
 }
 
-// Collect cards using the configured selector (if provided). Keeps previous mapping logic.
+// Parse one card's innerText (labels and values are on separate lines)
+function parseCard(text, imgSrc) {
+  const lines = text.split(/\n+/).map(x => x.trim()).filter(Boolean);
+  const valueAfter = (label) => {
+    const i = lines.findIndex(l => new RegExp(label, 'i').test(l) && l.length < 20);
+    return i >= 0 ? (lines[i + 1] || '') : '';
+  };
+  const title = lines[0] || '';
+  const creator = (lines.find(l => /^by\s/i.test(l)) || '').replace(/^by\s+/i, '');
+  const method = valueAfter('method');
+  const stock = valueAfter('stock');
+  const limit = valueAfter('limit');
+  const release = valueAfter('release');
+  const infoIdx = lines.findIndex(l => /\binfo\b/i.test(l) && l.length < 20);
+  const info = infoIdx >= 0
+    ? lines.slice(infoIdx + 1).filter(l => !/click for details/i.test(l)).join(' ')
+    : '';
+  // Cards can share a name, so the ID mixes in creator, details and the image URL
+  const id = [title, creator, method, limit, release, imgSrc || '', info].join('|').toLowerCase();
+  return { id, title, link: '', timestamp: release, stock, method, limit, info, category: '', description: creator ? `by ${creator}` : '', image: '' };
+}
+
 async function collectCardsFromPage(page) {
   const SEL = CONFIG.CARD_SELECTOR || '';
   if (SEL) {
@@ -299,6 +316,108 @@ async function heuristicDetect(page) {
   return cards;
 }
 
+// Attempt to discover JSON/XHR endpoints from the loaded page and fetch them
+async function fetchLeadsFromApi(page) {
+  try {
+    // Discover candidate URLs from scripts / inline JS
+    const candidates = await page.evaluate(() => {
+      const txts = [];
+      for (const s of Array.from(document.scripts)) {
+        if (s.src) txts.push(s.src);
+        if (s.innerText) txts.push(s.innerText.slice(0, 3000));
+      }
+      // also scan inline HTML for links
+      txts.push(document.documentElement.innerHTML.slice(0, 10000));
+      const joined = txts.join('\n');
+      const urls = new Set();
+      const reNext = /\/_next\/data\/[^"'\s]+\.json/g;
+      const reApi = /\/api\/[A-Za-z0-9_\-\/\.\?=&%]+/g;
+      const m1 = joined.match(reNext) || [];
+      const m2 = joined.match(reApi) || [];
+      m1.concat(m2).forEach(u=>urls.add(u));
+      return Array.from(urls);
+    }).catch(() => []);
+
+    const pageUrl = page.url();
+    const origin = (new URL(pageUrl)).origin;
+
+    // Build absolute URLs and add some common guesses
+    const abs = [];
+    for (const u of candidates) {
+      try { abs.push(u.startsWith('http') ? u : new URL(u, pageUrl).href); } catch(e){}
+    }
+    // add likely endpoints relative to origin/path
+    abs.push(new URL('/api/leaks', origin).href);
+    abs.push(new URL('/api/v1/leaks', origin).href);
+    abs.push(new URL('/leaks.json', origin).href);
+    abs.push(new URL(pageUrl + '.json', origin).href);
+
+    const uniq = [...new Set(abs)];
+    if (!uniq.length) return [];
+
+    const headers = {
+      'User-Agent': CONFIG.USER_AGENT,
+      'Accept': 'application/json, text/javascript, */*; q=0.01',
+      'Accept-Language': CONFIG.ACCEPT_LANGUAGE,
+      'Referer': CONFIG.TARGET_URL,
+    };
+
+    for (const url of uniq) {
+      try {
+        const res = await axios.get(url, { headers, timeout: 10000 });
+        if (res.status === 200 && res.data) {
+          const data = res.data;
+          // try to find an array of items
+          let items = null;
+          if (Array.isArray(data)) items = data;
+          else if (Array.isArray(data.items)) items = data.items;
+          else if (Array.isArray(data.data)) items = data.data;
+          else {
+            const findArray = (obj) => {
+              if (!obj || typeof obj !== 'object') return null;
+              for (const k of Object.keys(obj)) {
+                const val = obj[k];
+                if (Array.isArray(val) && val.length && typeof val[0] === 'object') return val;
+                if (typeof val === 'object') {
+                  const nested = findArray(val);
+                  if (nested) return nested;
+                }
+              }
+              return null;
+            };
+            items = findArray(data);
+          }
+          if (items && items.length) {
+            const cards = items.map(it => ({
+              title: (it.title || it.name || it.heading || it.label || '').toString(),
+              link: it.url || it.link || (it.path ? `${origin}${it.path}` : ''),
+              timestamp: it.release || it.date || it.timestamp || it.time || '',
+              stock: it.stock || it.inventory || '',
+              method: it.method || it.type || '',
+              info: it.info || it.description || it.desc || '',
+              image: it.image || it.img || it.thumbnail || it.cover || '',
+              category: it.category || it.tags || '',
+            })).filter(c => c.title);
+            if (cards.length) {
+              console.log('API fallback succeeded fetching', url, '->', cards.length, 'items');
+              return cards;
+            }
+          }
+        } else {
+          // non-200 helpful for debugging
+          // console.log('API', url, 'returned', res.status);
+        }
+      } catch (err) {
+        // ignore individual failures, log in debug
+        if (CONFIG.DEBUG) console.warn('API fetch failed for', url, err?.message || err);
+      }
+    }
+  } catch (e) {
+    if (CONFIG.DEBUG) console.warn('API discovery failed', e?.message || e);
+  }
+  return [];
+}
+
 // Scraping flow with stealthy context, retry loop for challenges, and jitter
 async function scrapeOnce(browser) {
   const context = await browser.newContext({
@@ -307,17 +426,13 @@ async function scrapeOnce(browser) {
     locale: CONFIG.ACCEPT_LANGUAGE.split(',')[0] || 'en-US',
   });
 
-  // set extra headers
   await context.setExtraHTTPHeaders({
     'accept-language': CONFIG.ACCEPT_LANGUAGE,
     'referer': CONFIG.TARGET_URL,
   });
 
-  // inject small init script to override automation flags
   await context.addInitScript(() => {
-    try {
-      Object.defineProperty(navigator, 'webdriver', { get: () => false });
-    } catch (e) {}
+    try { Object.defineProperty(navigator, 'webdriver', { get: () => false }); } catch (e) {}
     try { Object.defineProperty(navigator, 'languages', { get: () => ['en-US','en'] }); } catch (e) {}
     try { Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] }); } catch (e) {}
     try { window.chrome = window.chrome || { runtime: {} }; } catch (e) {}
@@ -336,7 +451,6 @@ async function scrapeOnce(browser) {
 
   const page = await context.newPage();
 
-  // response logging for debugging (prints 4xx/5xx and a body preview)
   page.on('response', async (res) => {
     try {
       const status = res.status();
@@ -351,7 +465,6 @@ async function scrapeOnce(browser) {
     } catch (e) { /* ignore */ }
   });
 
-  // navigation (domcontentloaded) + retry/poll loop for challenge clearance
   await page.goto(CONFIG.TARGET_URL, { waitUntil: 'domcontentloaded' }).catch(() => null);
 
   const start = Date.now();
@@ -370,7 +483,6 @@ async function scrapeOnce(browser) {
     console.log('Challenge cleared — proceeding to parse DOM.');
   }
 
-  // small random delay before parsing
   await jitterDelay(1000, 3000);
 
   // Try configured selector first
@@ -391,7 +503,12 @@ async function scrapeOnce(browser) {
     cards = await heuristicDetect(page);
   }
 
-  // Save debug artifacts optionally
+  // API fallback: try to discover and fetch JSON endpoints (works well for Vercel/Next.js sites)
+  if (!cards.length) {
+    const apiCards = await fetchLeadsFromApi(page);
+    if (apiCards && apiCards.length) cards = apiCards;
+  }
+
   if (CONFIG.DEBUG) await saveDebugArtifacts(page);
 
   await page.close();
@@ -401,8 +518,8 @@ async function scrapeOnce(browser) {
 }
 
 async function runOnceFlow(browser, seenState) {
-  // seenState = { store: { seen: [] }, sha }
   const items = await scrapeOnce(browser);
+  if (!items.length) { console.log('No cards found on the page.'); return; }
   const newItems = [];
   for (const card of items) {
     const id = idFromCard(card);
@@ -411,6 +528,15 @@ async function runOnceFlow(browser, seenState) {
       seenState.store.seen.push(id);
     }
   }
+  const needsSeed = process.env.SEED_ONLY === 'true' || seenState.store.version !== 2;
+  if (needsSeed) {
+    seenState.store.version = 2;
+    console.log('Seeding: marking', newItems.length, 'card(s) as seen without posting (', seenState.store.seen.length, 'total ).');
+    const sha = await saveSeen(seenState.store, seenState.sha);
+    if (sha) seenState.sha = sha;
+    else if (CONFIG.GITHUB_TOKEN && CONFIG.GITHUB_REPOSITORY) console.error('WARNING: seeding could not be saved to GitHub.');
+    return;
+  }
   if (newItems.length) {
     console.log('Found', newItems.length, 'new item(s). Posting...');
     for (const it of newItems) {
@@ -418,7 +544,6 @@ async function runOnceFlow(browser, seenState) {
       await postToDiscord(payload);
       await new Promise(r => setTimeout(r, 750));
     }
-    // persist seen list
     const newSha = await saveSeen(seenState.store, seenState.sha);
     if (newSha) {
       seenState.sha = newSha;
